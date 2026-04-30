@@ -4,7 +4,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
-import { Plus, Send, Trash2, MessageSquare, Bot, User, Loader2, CheckCircle, XCircle, Terminal, ChevronDown, ChevronUp, AlertCircle, FileText, Code2, GitFork, Pencil, Check, X, Zap, ShieldCheck, ShieldAlert, ShieldOff, PlusCircle, Brain, Wrench } from "lucide-react";
+import { Plus, Send, Trash2, MessageSquare, Bot, User, Loader2, CheckCircle, XCircle, Terminal, ChevronDown, ChevronUp, AlertCircle, FileText, Code2, GitFork, Pencil, Check, X, Zap, ShieldCheck, ShieldAlert, ShieldOff, PlusCircle, Brain, Wrench, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ChatConversation, ChatMessage } from "@shared/schema";
 
@@ -89,6 +89,18 @@ function AgentRoster({ agents, onMention }: { agents: WorkspaceAgent[]; onMentio
     next.has(key) ? next.delete(key) : next.add(key);
     return next;
   });
+
+  if (agents.length === 0) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-4 px-2 text-center">
+        <Bot className="w-7 h-7 text-muted-foreground/40" />
+        <p className="text-[11px] text-muted-foreground/60 leading-snug">
+          No agents yet.<br />
+          Create an orchestrator &amp; agent to get started.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-1.5">
@@ -198,7 +210,7 @@ export default function ChatPage({ workspaceId }: Props) {
     if (!activeConvId) return;
     setDisplayMessages([]);
     setConfirmStates(new Map());
-    fetch(`/api/conversations/${activeConvId}/messages`)
+    fetch(`/api/conversations/${activeConvId}/messages`, { credentials: "include" })
       .then(r => r.json())
       .then((msgs: ChatMessage[]) => {
         setDisplayMessages(msgs ?? []);
@@ -423,14 +435,36 @@ export default function ChatPage({ workspaceId }: Props) {
                 : m
             ));
           } else if (event.type === "agent_done") {
-            const { agentId, messageId, agentName, metadata } = event;
+            const { agentId, messageId, agentName, metadata, taskId, orchestratorId } = event as any;
+            const mergedMeta = {
+              ...(metadata ?? {}),
+              ...(taskId ? { taskId, orchestratorId } : {}),
+            };
             setDisplayMessages(prev => prev.map(m =>
               m.id === `streaming-${agentId}` && m.role === "streaming"
-                ? { ...m, id: messageId, role: "agent" as const, agentName, metadata: metadata ?? {}, streaming: undefined } as unknown as ChatMessage
+                ? { ...m, id: messageId, role: "agent" as const, agentName, metadata: mergedMeta, streaming: undefined } as unknown as ChatMessage
                 : m
             ));
           } else if (event.type === "agent_error") {
-            setDisplayMessages(prev => prev.filter(m => m.id !== `streaming-${event.agentId}`));
+            setDisplayMessages(prev => {
+              const withoutPlaceholder = prev.filter(m => m.id !== `streaming-${event.agentId}`);
+              if (event.error) {
+                const errMsg: ChatMessage = {
+                  id: `err-${Date.now()}`,
+                  conversationId: activeConvId ?? "",
+                  role: "agent",
+                  agentId: null,
+                  content: `⚠️ ${event.error}`,
+                  agentName: "System",
+                  mentions: [],
+                  messageType: "text",
+                  metadata: {},
+                  createdAt: new Date(),
+                };
+                return [...withoutPlaceholder, errMsg];
+              }
+              return withoutPlaceholder;
+            });
           } else if (event.type === "subtask_start") {
             if (!currentCoordinatorAgentId) continue;
             const coordId = currentCoordinatorAgentId;
@@ -801,9 +835,9 @@ export default function ChatPage({ workspaceId }: Props) {
                 );
               }
               if ((msg as ChatMessage).messageType === "task_result") {
-                return <MessageBubble key={msg.id} message={msg} isTaskResult />;
+                return <MessageBubble key={msg.id} message={msg} isTaskResult workspaceId={workspaceId} />;
               }
-              return <MessageBubble key={msg.id} message={msg} />;
+              return <MessageBubble key={msg.id} message={msg} workspaceId={workspaceId} />;
             })}
             <div ref={messagesEndRef} />
           </div>
@@ -1299,7 +1333,7 @@ function ToolCallRow({ item }: { item: ToolActivityItem }) {
   );
 }
 
-function MessageBubble({ message, isTaskResult }: { message: DisplayMessage; isTaskResult?: boolean }) {
+function MessageBubble({ message, isTaskResult, workspaceId }: { message: DisplayMessage; isTaskResult?: boolean; workspaceId?: string }) {
   const isUser = message.role === "user";
   const isStreaming = (message as StreamingMsg).streaming === true;
   const codeRunning = (message as StreamingMsg).codeRunning;
@@ -1393,6 +1427,16 @@ function MessageBubble({ message, isTaskResult }: { message: DisplayMessage; isT
           <div className="w-full max-w-[90%]">
             <SourcesAccordion sources={sources} />
           </div>
+        )}
+        {!isUser && !isStreaming && !!meta?.taskId && !!workspaceId && !!meta?.orchestratorId && (
+          <a
+            href={`/workspaces/${workspaceId}/orchestrators/${meta.orchestratorId}/tasks/${meta.taskId}`}
+            className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-primary transition-colors px-1"
+            data-testid={`link-trace-${message.id}`}
+          >
+            <Activity className="w-3 h-3" />
+            View trace
+          </a>
         )}
       </div>
     </div>

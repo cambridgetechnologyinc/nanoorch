@@ -486,6 +486,206 @@ const INCREMENTAL_MIGRATIONS: Array<{ name: string; sql: string }> = [
     name: "add_cloud_provider_kubernetes",
     sql: `ALTER TYPE "cloud_provider" ADD VALUE IF NOT EXISTS 'kubernetes'`,
   },
+  // ── Phase 1: Autonomous Triggering ────────────────────────────────────────────
+  {
+    name: "add_channel_type_email",
+    sql: `ALTER TYPE "channel_type" ADD VALUE IF NOT EXISTS 'email'`,
+  },
+  {
+    name: "create_job_queue_status_enum",
+    sql: `DO $$ BEGIN
+      CREATE TYPE "job_queue_status" AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled');
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  },
+  {
+    name: "create_job_queue",
+    sql: `CREATE TABLE IF NOT EXISTS "job_queue" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "workspace_id" varchar NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      "orchestrator_id" varchar NOT NULL REFERENCES orchestrators(id) ON DELETE CASCADE,
+      "agent_id" varchar REFERENCES agents(id) ON DELETE SET NULL,
+      "prompt" text NOT NULL,
+      "priority" integer DEFAULT 5,
+      "status" job_queue_status DEFAULT 'pending',
+      "source" text DEFAULT 'manual',
+      "source_ref" text,
+      "scheduled_for" timestamp,
+      "task_id" varchar REFERENCES tasks(id) ON DELETE SET NULL,
+      "error" text,
+      "created_at" timestamp DEFAULT now(),
+      "started_at" timestamp,
+      "completed_at" timestamp
+    )`,
+  },
+  {
+    name: "create_job_queue_idx",
+    sql: `CREATE INDEX IF NOT EXISTS "job_queue_status_priority_idx" ON "job_queue" ("status", "priority" DESC, "created_at" ASC)`,
+  },
+  {
+    name: "create_email_threads",
+    sql: `CREATE TABLE IF NOT EXISTS "email_threads" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "channel_id" varchar NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+      "message_id" text NOT NULL,
+      "from_email" text NOT NULL,
+      "from_name" text,
+      "subject" text,
+      "agent_id" varchar REFERENCES agents(id) ON DELETE SET NULL,
+      "history" jsonb DEFAULT '[]',
+      "created_at" timestamp DEFAULT now(),
+      "last_activity_at" timestamp DEFAULT now(),
+      UNIQUE("channel_id", "message_id")
+    )`,
+  },
+  // ── Phase 2: Agent Roles & Specialization ────────────────────────────────────
+  {
+    name: "add_agents_role",
+    sql: `ALTER TABLE "agents" ADD COLUMN IF NOT EXISTS "role" text`,
+  },
+  {
+    name: "create_agent_role_enum",
+    sql: `DO $$ BEGIN
+      CREATE TYPE "agent_role" AS ENUM ('devops', 'data_analyst', 'support', 'code_review', 'security', 'git_ops', 'monitoring', 'custom');
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  },
+  {
+    name: "create_agent_templates",
+    sql: `CREATE TABLE IF NOT EXISTS "agent_templates" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "name" text NOT NULL,
+      "role" text NOT NULL,
+      "description" text NOT NULL,
+      "category" text NOT NULL DEFAULT 'general',
+      "icon" text NOT NULL DEFAULT 'Bot',
+      "color" text NOT NULL DEFAULT '#6366f1',
+      "instructions" text NOT NULL,
+      "suggested_tools" text[] DEFAULT '{}',
+      "default_max_tokens" integer DEFAULT 4096,
+      "default_temperature" integer DEFAULT 70,
+      "is_built_in" boolean DEFAULT true,
+      "created_at" timestamp DEFAULT now()
+    )`,
+  },
+
+  // ── Phase 3: Visual Trace Graph + Enhanced Observability ─────────────────────
+  {
+    name: "create_trace_spans",
+    sql: `CREATE TABLE IF NOT EXISTS "trace_spans" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "task_id" varchar NOT NULL REFERENCES "tasks"("id") ON DELETE CASCADE,
+      "parent_span_id" varchar REFERENCES "trace_spans"("id") ON DELETE CASCADE,
+      "span_type" text NOT NULL DEFAULT 'info',
+      "name" text NOT NULL,
+      "input" jsonb,
+      "output" jsonb,
+      "metadata" jsonb,
+      "status" text NOT NULL DEFAULT 'running',
+      "started_at" timestamp DEFAULT now(),
+      "ended_at" timestamp,
+      "duration_ms" integer,
+      "seq" integer NOT NULL DEFAULT 0
+    )`,
+  },
+  {
+    name: "create_trace_spans_idx",
+    sql: `CREATE INDEX IF NOT EXISTS "trace_spans_task_id_idx" ON "trace_spans"("task_id")`,
+  },
+
+  // ── Phase 4: Audit Log + Usage Governance ─────────────────────────────────────
+  {
+    name: "create_audit_log",
+    sql: `CREATE TABLE IF NOT EXISTS "audit_log" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "workspace_id" varchar REFERENCES "workspaces"("id") ON DELETE SET NULL,
+      "user_id" varchar REFERENCES "users"("id") ON DELETE SET NULL,
+      "username" text,
+      "action" text NOT NULL,
+      "resource_type" text,
+      "resource_id" text,
+      "resource_name" text,
+      "details" jsonb,
+      "ip_address" text,
+      "user_agent" text,
+      "created_at" timestamp DEFAULT now()
+    )`,
+  },
+  {
+    name: "create_audit_log_idx",
+    sql: `CREATE INDEX IF NOT EXISTS "audit_log_workspace_idx" ON "audit_log"("workspace_id", "created_at" DESC)`,
+  },
+  {
+    name: "create_workspace_quotas",
+    sql: `CREATE TABLE IF NOT EXISTS "workspace_quotas" (
+      "workspace_id" varchar PRIMARY KEY REFERENCES "workspaces"("id") ON DELETE CASCADE,
+      "monthly_token_limit" bigint,
+      "daily_token_limit" bigint,
+      "monthly_cost_limit_cents" integer,
+      "alert_threshold_pct" integer NOT NULL DEFAULT 80,
+      "enforcement" text NOT NULL DEFAULT 'warn',
+      "updated_at" timestamp DEFAULT now()
+    )`,
+  },
+  // ── Phase 5: Prompt Library ─────────────────────────────────────────────────
+  {
+    name: "create_prompt_templates",
+    sql: `CREATE TABLE IF NOT EXISTS "prompt_templates" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "workspace_id" varchar NOT NULL REFERENCES "workspaces"("id") ON DELETE CASCADE,
+      "created_by" varchar REFERENCES "users"("id") ON DELETE SET NULL,
+      "name" text NOT NULL,
+      "description" text,
+      "content" text NOT NULL,
+      "category" text NOT NULL DEFAULT 'general',
+      "tags" text[] DEFAULT '{}',
+      "is_shared" boolean NOT NULL DEFAULT true,
+      "usage_count" integer NOT NULL DEFAULT 0,
+      "created_at" timestamp DEFAULT now(),
+      "updated_at" timestamp DEFAULT now()
+    )`,
+  },
+  {
+    name: "create_prompt_templates_idx",
+    sql: `CREATE INDEX IF NOT EXISTS "prompt_templates_workspace_idx" ON "prompt_templates"("workspace_id")`,
+  },
+
+  // ── Phase 6: Alert Rules ─────────────────────────────────────────────────────
+  {
+    name: "create_alert_rules",
+    sql: `CREATE TABLE IF NOT EXISTS "alert_rules" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "workspace_id" varchar NOT NULL REFERENCES "workspaces"("id") ON DELETE CASCADE,
+      "name" text NOT NULL,
+      "description" text,
+      "trigger_type" text NOT NULL,
+      "conditions" jsonb NOT NULL DEFAULT '{}',
+      "channel_id" varchar REFERENCES "channels"("id") ON DELETE SET NULL,
+      "enabled" boolean NOT NULL DEFAULT true,
+      "last_triggered_at" timestamp,
+      "trigger_count" integer NOT NULL DEFAULT 0,
+      "created_at" timestamp DEFAULT now(),
+      "updated_at" timestamp DEFAULT now()
+    )`,
+  },
+  {
+    name: "create_alert_rules_idx",
+    sql: `CREATE INDEX IF NOT EXISTS "alert_rules_workspace_idx" ON "alert_rules"("workspace_id")`,
+  },
+
+  {
+    name: "create_platform_api_keys",
+    sql: `CREATE TABLE IF NOT EXISTS "platform_api_keys" (
+      "id" varchar PRIMARY KEY DEFAULT gen_random_uuid(),
+      "workspace_id" varchar NOT NULL REFERENCES "workspaces"("id") ON DELETE CASCADE,
+      "user_id" varchar REFERENCES "users"("id") ON DELETE SET NULL,
+      "name" text NOT NULL,
+      "key_hash" text NOT NULL UNIQUE,
+      "key_prefix" text NOT NULL,
+      "scopes" text[] DEFAULT '{}',
+      "last_used_at" timestamp,
+      "expires_at" timestamp,
+      "created_at" timestamp DEFAULT now()
+    )`,
+  },
 ];
 
 const IDEMPOTENT_ERROR_CODES = new Set([
@@ -498,9 +698,6 @@ const IDEMPOTENT_ERROR_CODES = new Set([
 ]);
 
 async function applySqlFile(client: any, filePath: string, fileName: string): Promise<void> {
-  if (!fileName.endsWith(".sql") || fileName.includes("..") || fileName.includes("/")) {
-    throw new Error(`[migrate] Refusing to apply unsafe migration filename: ${fileName}`);
-  }
   const migrationKey = `file:${fileName}`;
   const { rows } = await client.query(
     `SELECT name FROM _nanoorch_migrations WHERE name = $1`,
@@ -508,7 +705,7 @@ async function applySqlFile(client: any, filePath: string, fileName: string): Pr
   );
   if (rows.length > 0) return;
 
-  const content = await readFile(filePath, "utf-8"); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename -- filePath is join(migrationsDir, file) where file is validated to end with ".sql" without traversal
+  const content = await readFile(filePath, "utf-8");
   const statements = content
     .split("-->statement-breakpoint")
     .map((s: string) => s.trim())
@@ -572,20 +769,4 @@ export async function runMigrations(): Promise<void> {
   } finally {
     client.release();
   }
-}
-
-// When executed directly as the standalone migrate script (dist/migrate.cjs),
-// run migrations and exit.  Guarded by argv check so this block is NOT
-// triggered when migrate.ts is imported by index.ts (index.cjs).
-if (/migrate\.cjs$/.test(process.argv[1] ?? "") || /migrate\.ts$/.test(process.argv[1] ?? "")) {
-  runMigrations()
-    .then(() => pool.end())
-    .then(() => {
-      console.log("[db] Migrations complete.");
-      process.exit(0);
-    })
-    .catch((err: unknown) => {
-      console.error("[db] Migration failed:", err);
-      process.exit(1);
-    });
 }

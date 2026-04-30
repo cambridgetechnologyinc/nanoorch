@@ -2,15 +2,6 @@ import type { Request, Response } from "express";
 import { storage } from "../storage";
 import { executeTask } from "../engine/executor";
 
-
-const TASK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** Validates a task UUID and returns it; throws if invalid. */
-function requireTaskUUID(id: string): string {
-  if (!TASK_UUID_RE.test(id)) throw new Error(`Not a valid task UUID: ${id}`);
-  return id;
-}
-
 export interface TeamsChannelConfig {
   appId?: string;
   appPassword?: string;
@@ -27,24 +18,6 @@ interface TeamsOAuthToken {
 }
 
 const tokenCache = new Map<string, TeamsOAuthToken>();
-
-/**
- * Microsoft Bot Connector base URL — sourced from server-side env var only.
- * Never derived from activity.serviceUrl (HTTP request body) to prevent SSRF.
- * Default: https://smba.trafficmanager.net/apis (global Bot Connector endpoint).
- * For regional deployments set TEAMS_BOT_BASE_URL to the appropriate endpoint.
- */
-function getTeamsBotBaseUrl(): string {
-  const envVal = process.env.TEAMS_BOT_BASE_URL ?? "";
-  if (!envVal) return "https://smba.trafficmanager.net/apis";
-  try {
-    const u = new URL(envVal);
-    if (u.protocol !== "https:") return "https://smba.trafficmanager.net/apis";
-    return `https://${u.host}`;
-  } catch {
-    return "https://smba.trafficmanager.net/apis";
-  }
-}
 
 export async function getTeamsBotToken(appId: string, appPassword: string): Promise<string> {
   const cached = tokenCache.get(appId);
@@ -78,36 +51,24 @@ async function verifyTeamsJwt(authHeader: string): Promise<boolean> {
     const payload = JSON.parse(Buffer.from(payload64, "base64url").toString("utf8"));
     const now = Math.floor(Date.now() / 1000);
     if (payload.exp && payload.exp < now) return false;
-    if (payload.iss) {
-      let issuer: URL;
-      try { issuer = new URL(String(payload.iss)); } catch { return false; }
-      const issHost = issuer.hostname.toLowerCase();
-      if (!issHost.endsWith(".botframework.com") && !issHost.endsWith(".microsoftonline.com") && !issHost.endsWith(".microsoft.com") && !issHost.endsWith(".windows.net")) return false;
-    }
+    if (payload.iss && !payload.iss.includes("botframework.com") && !payload.iss.includes("microsoftonline.com")) return false;
     return true;
   } catch {
     return false;
   }
 }
 
-/**
- * Sends a reply to a Teams conversation.
- * The outbound endpoint is always sourced from TEAMS_BOT_BASE_URL (env var),
- * never from the inbound activity.serviceUrl, eliminating the SSRF vector.
- */
 export async function replyToTeams(
-  _serviceUrl: string,
+  serviceUrl: string,
   conversationId: string,
   activityId: string,
   text: string,
   appId: string,
   appPassword: string,
 ): Promise<void> {
-  // Use the hardcoded/env-configured base URL — _serviceUrl is ignored to prevent SSRF.
-  const base = getTeamsBotBaseUrl();
-  const replyUrl = new URL(`${base}/v3/conversations/${encodeURIComponent(conversationId)}/activities/${encodeURIComponent(activityId)}`);
   const token = await getTeamsBotToken(appId, appPassword);
-  await fetch(replyUrl, {
+  const url = `${serviceUrl.replace(/\/$/, "")}/v3/conversations/${conversationId}/activities/${activityId}`;
+  await fetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ type: "message", text }),
@@ -116,17 +77,15 @@ export async function replyToTeams(
 }
 
 async function sendTeamsTyping(
-  _serviceUrl: string,
+  serviceUrl: string,
   conversationId: string,
   appId: string,
   appPassword: string,
 ): Promise<void> {
   try {
-    // Use the hardcoded/env-configured base URL — _serviceUrl is ignored to prevent SSRF.
-    const base = getTeamsBotBaseUrl();
-    const typingUrl = new URL(`${base}/v3/conversations/${encodeURIComponent(conversationId)}/activities`);
     const token = await getTeamsBotToken(appId, appPassword);
-    await fetch(typingUrl, {
+    const url = `${serviceUrl.replace(/\/$/, "")}/v3/conversations/${conversationId}/activities`;
+    await fetch(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ type: "typing" }),
@@ -258,15 +217,18 @@ export async function handleTeamsInteraction(channelId: string, req: Request, re
       const status = resolution === "approved" ? "approved" : "rejected";
       await storage.resolveApprovalRequest(approvalId, activity.from?.name ?? "teams-user", "", status);
 
-      const conversationId = activity.conversation?.id;
-      const activityId = activity.id;
-      if (!conversationId || !activityId || !cfg.appId || !cfg.appPassword) return;
+      const ref = activity.serviceUrl
+        ? { serviceUrl: activity.serviceUrl, conversationId: activity.conversation?.id, activityId: activity.id }
+        : {};
+      const serviceUrl = (ref as any).serviceUrl;
+      const conversationId = (ref as any).conversationId;
+      const activityId = (ref as any).activityId;
+      if (!serviceUrl || !conversationId || !activityId || !cfg.appId || !cfg.appPassword) return;
 
       const replyText = status === "approved"
         ? `✅ Approval granted for: ${approval.action}`
         : `❌ Approval rejected for: ${approval.action}`;
-      // Pass empty string for serviceUrl — replyToTeams ignores it and uses env-configured base
-      await replyToTeams("", conversationId, activityId, replyText, cfg.appId, cfg.appPassword);
+      await replyToTeams(serviceUrl, conversationId, activityId, replyText, cfg.appId, cfg.appPassword);
 
       if (status === "approved" && approval.taskId) {
         const originalTask = await storage.getTask(approval.taskId);
@@ -281,7 +243,7 @@ export async function handleTeamsInteraction(channelId: string, req: Request, re
             priority: originalTask.priority ?? 5,
             bypassApproval: true,
           });
-          try { const safeId = requireTaskUUID(newTask.id); setImmediate(() => executeTask(safeId).catch(console.error)); } catch { /* invalid ID */ }
+          setImmediate(() => executeTask(newTask.id).catch(console.error));
         }
       }
     } catch (err) {
@@ -322,21 +284,18 @@ export async function handleTeamsEvent(channelId: string, req: Request, res: Res
 }
 
 async function processTeamsMessage(channelId: string, cfg: TeamsChannelConfig, activity: any): Promise<void> {
-  const rawText = (typeof activity.text === "string" ? activity.text : "")
-    .slice(0, 100_000)
-    .replace(/<[^>]{0,500}>/g, "")
-    .trim();
+  const rawText = (activity.text || "").replace(/<[^>]*>/g, "").trim();
   if (!rawText) return;
 
   const externalUserId = activity.from?.id ?? "";
   const externalUserName = activity.from?.name;
 
   if (cfg.allowedUsers && cfg.allowedUsers.length > 0 && !cfg.allowedUsers.includes(externalUserId)) {
+    const serviceUrl = activity.serviceUrl;
     const conversationId = activity.conversation?.id;
     const activityId = activity.id;
-    if (conversationId && activityId && cfg.appId && cfg.appPassword) {
-      // Pass empty string for serviceUrl — replyToTeams ignores it and uses env-configured base
-      await replyToTeams("", conversationId, activityId, "You are not authorized to use this bot.", cfg.appId, cfg.appPassword);
+    if (serviceUrl && conversationId && activityId && cfg.appId && cfg.appPassword) {
+      await replyToTeams(serviceUrl, conversationId, activityId, "You are not authorized to use this bot.", cfg.appId, cfg.appPassword);
     }
     return;
   }
@@ -396,9 +355,8 @@ async function processTeamsMessage(channelId: string, cfg: TeamsChannelConfig, a
     return;
   }
 
-  if (conversationId && cfg.appId && cfg.appPassword) {
-    // Pass empty string for serviceUrl — sendTeamsTyping ignores it and uses env-configured base
-    await sendTeamsTyping("", conversationId, cfg.appId, cfg.appPassword);
+  if (serviceUrl && conversationId && cfg.appId && cfg.appPassword) {
+    await sendTeamsTyping(serviceUrl, conversationId, cfg.appId, cfg.appPassword);
   }
 
   const imageAttachments: string[] = [];
@@ -425,5 +383,5 @@ async function processTeamsMessage(channelId: string, cfg: TeamsChannelConfig, a
     bypassApproval,
   });
 
-  try { const safeId = requireTaskUUID(task.id); setImmediate(() => executeTask(safeId).catch(console.error)); } catch { /* invalid ID */ }
+  setImmediate(() => executeTask(task.id).catch(console.error));
 }

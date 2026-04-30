@@ -70,115 +70,51 @@ NanoOrch is a **self-hosted, multi-tenant AI agent orchestrator**. It lets teams
 
 ## 2. High-Level Architecture Diagram
 
-![NanoOrch System Architecture](./docs/nanoorch-architecture.png)
-
-```mermaid
-flowchart TB
-    classDef clientCls  fill:#0d2137,stroke:#3b82f6,color:#e2e8f0
-    classDef engineCls  fill:#0d2a1a,stroke:#22c55e,color:#e2e8f0
-    classDef wsCls      fill:#1a0d2a,stroke:#a855f7,color:#e2e8f0
-    classDef msgCls     fill:#2a0d0d,stroke:#ef4444,color:#e2e8f0
-    classDef cloudCls   fill:#0d1a2a,stroke:#60a5fa,color:#e2e8f0
-    classDef aiCls      fill:#2a2a0d,stroke:#eab308,color:#e2e8f0
-    classDef dataCls    fill:#0d2a2a,stroke:#14b8a6,color:#e2e8f0
-    classDef dockerCls  fill:#1a1a1a,stroke:#94a3b8,color:#e2e8f0
-
-    %% ── ACCESS & IDENTITY ──────────────────────────────────────────────────
-    subgraph ACCESS["🔐  Access & Identity"]
-        direction LR
-        WEB["Web Browser\nReact + Vite SPA"]
-        SSO["SSO\nOIDC · SAML 2.0"]
-        RBAC["3-Tier RBAC\nSuper Admin · WS Admin · Member"]
-        GW["API Gateway\nSession Auth · CSRF · Rate Limits"]
-        MCP["MCP Server /mcp\nHTTP/SSE · 8 workspace tools\n─\nAI Client (Claude Desktop)\nBearer API Key nano_mcp_..."]
-    end
-
-    ACCESS -->|"HTTPS  ·  REST + SSE"| ENGINE
-
-    %% ── ORCHESTRATION ENGINE ───────────────────────────────────────────────
-    subgraph ENGINE["⚡  Orchestration Engine"]
-        direction LR
-        EXEC["Task Executor\nParallel · Retry · Failover"]
-        DAG["Pipeline / DAG\nMulti-step chaining"]
-        CRON["Cron Scheduler\nTimezone-aware jobs"]
-        TRIG["Event Triggers\nGitHub · GitLab · Jira webhooks"]
-        HB["Heartbeat Monitor\nPer-agent health checks"]
-        GATES["Approval Gates\nHuman-in-the-loop"]
-    end
-
-    ENGINE <-->|"dispatch / results"| WORKSPACES
-
-    %% ── MULTI-TENANT WORKSPACES ────────────────────────────────────────────
-    subgraph WORKSPACES["🏢  Multi-Tenant Workspaces"]
-        direction LR
-        ORCH["Orchestrators\nProvider · Model · Concurrency"]
-        AGENTS["Agents\nInstructions · Tools · Memory"]
-        MEMBERS["Workspace Members\nIsolated per tenant"]
-        LIMITS["Resource Limits\nOrchestrators · Agents · Channels"]
-        OBS["Observability\nToken usage · Utilization alerts"]
-        CHAN["Channel Delivery\nTask · Heartbeat · Pipeline · Job"]
-    end
-
-    WORKSPACES <-->|"inbound / outbound"| MESSAGING
-    WORKSPACES -->|"API calls"| CLOUD
-
-    %% ── TWO-WAY MESSAGING ──────────────────────────────────────────────────
-    subgraph MESSAGING["💬  Two-Way Messaging"]
-        direction LR
-        SLACK["Slack\nInbound + Outbound"]
-        TEAMS["Microsoft Teams\nInbound + Outbound"]
-        GCHAT["Google Chat\nInbound + Outbound"]
-        HOOK["Generic Webhook\nOutbound delivery"]
-    end
-
-    %% ── CLOUD & DEVTOOLS ───────────────────────────────────────────────────
-    subgraph CLOUD["☁️  Cloud & DevTools Integrations"]
-        direction LR
-        AWS["AWS"] & GCP["GCP"] & AZURE["Azure"]
-        GH["GitHub"] & GL["GitLab"] & JR["Jira"]
-    end
-
-    %% ── AI PROVIDERS ───────────────────────────────────────────────────────
-    ENGINE -->|"model inference"| AI
-
-    subgraph AI["🧠  AI Providers  ·  Failover: primary → fallback automatically"]
-        direction LR
-        OPENAI["OpenAI\nGPT-4o · GPT-4o mini"]
-        ANTHROPIC["Anthropic\nClaude 3.5 Sonnet+"]
-        GEMINI["Google Gemini\nGemini 2.0 Flash+"]
-        OLLAMA["Ollama\nSelf-hosted models"]
-    end
-
-    %% ── DATA LAYER ─────────────────────────────────────────────────────────
-    ENGINE & WORKSPACES -->|"read / write  (Drizzle ORM)"| DATA
-
-    subgraph DATA["🗄️  Data Layer"]
-        direction LR
-        PG["PostgreSQL 16\nPrimary data store · Migrations"]
-        USAGE["Token Usage & Cost\nPer workspace · Per model"]
-        CREDS["Encrypted Credentials\nAES-256-GCM · Docker Secrets"]
-        LOGS["Audit Logs\nTask logs · Delivery history"]
-    end
-
-    %% ── DOCKER RUNTIME ─────────────────────────────────────────────────────
-    ENGINE -->|"spawn containers"| DOCKER
-
-    subgraph DOCKER["🐳  Docker Runtime  (optional · production)"]
-        direction LR
-        AGT["nanoorch-agent\nephemeral per-task containers"]
-        SBX["nanoorch-sandbox\ngVisor runsc · code interpreter"]
-    end
-
-    %% ── STYLES ─────────────────────────────────────────────────────────────
-    class WEB,SSO,RBAC,GW,MCP clientCls
-    class EXEC,DAG,CRON,TRIG,HB,GATES engineCls
-    class ORCH,AGENTS,MEMBERS,LIMITS,OBS,CHAN wsCls
-    class SLACK,TEAMS,GCHAT,HOOK msgCls
-    class AWS,GCP,AZURE,GH,GL,JR cloudCls
-    class OPENAI,ANTHROPIC,GEMINI,OLLAMA aiCls
-    class PG,USAGE,CREDS,LOGS dataCls
-    class AGT,SBX dockerCls
 ```
+                          ┌────────────────────────────────────────────────────────┐
+                          │                  Browser / Client                       │
+                          │   React + Vite · wouter · TanStack Query · shadcn/ui   │
+                          └───────────────────────┬────────────────────────────────┘
+                                                  │ HTTPS (REST + SSE + WebSocket)
+                          ┌───────────────────────▼────────────────────────────────┐
+                          │              Express Application Server                 │
+                          │                                                        │
+                          │  ┌──────────┐  ┌───────────┐  ┌───────────────────┐  │
+                          │  │ Auth /   │  │  REST API  │  │  Webhook handlers │  │
+                          │  │ SSO      │  │  (routes)  │  │  (GH/GL/Jira)    │  │
+                          │  └──────────┘  └─────┬─────┘  └─────────┬─────────┘  │
+                          │                      │                   │            │
+                          │  ┌────────────────────▼───────────────────▼────────┐  │
+                          │  │                  Storage Layer                   │  │
+                          │  │         (Drizzle ORM → PostgreSQL)               │  │
+                          │  └──────────────────────────────────────────────────┘  │
+                          │                                                        │
+                          │  ┌──────────────────────────────────────────────────┐  │
+                          │  │               Execution Engine                    │  │
+                          │  │  Queue Worker → Executor → Docker/Local executor  │  │
+                          │  │  Inference Proxy · Sandbox executor               │  │
+                          │  │  Scheduler · Pipeline executor · Notifier         │  │
+                          │  └──────────────────────────────────────────────────┘  │
+                          └────────────────┬────────────────┬───────────────────────┘
+                                           │                │
+                   ┌───────────────────────▼──┐         ┌───▼──────────────────────────┐
+                   │    PostgreSQL 16          │         │  External Services            │
+                   │  (user sessions,          │         │  OpenAI · Anthropic · Gemini  │
+                   │   tasks, agents,          │         │  Ollama · AWS · GCP · Azure   │
+                   │   pipelines, SSO,         │         │  Jira · GitHub · GitLab       │
+                   │   triggers, usage, ...)   │         │  ServiceNow · RAGFlow         │
+                   │                           │         │  Slack · Teams · Google Chat  │
+                   └───────────────────────────┘         └──────────────────────────────┘
+                                           │
+                   ┌───────────────────────▼──────────────────────────────────────────┐
+                   │               Docker Daemon (optional, production)                │
+                   │   nanoorch-agent:latest  ─── ephemeral per-task containers        │
+                   │   nanoorch-sandbox:latest ─── code interpreter containers         │
+                   │   Runtime: runc (default) or gVisor runsc (hardened)             │
+                   └──────────────────────────────────────────────────────────────────┘
+```
+
+> **Visual reference:** `docs/screenshots/nanoorch-architecture_1774022201704.png` contains a graphical overview of the full system architecture.
 
 ---
 

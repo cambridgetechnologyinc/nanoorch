@@ -4,12 +4,6 @@ A self-hosted, multi-tenant platform for orchestrating AI agents across OpenAI, 
 
 ---
 
-## Architecture
-
-![NanoOrch System Architecture](./docs/nanoorch-architecture.png)
-
----
-
 ## Features
 
 - **Auth & 3-tier RBAC** — session-based login; global admin, workspace admin, and member roles with distinct access levels; optional SSO via OIDC or SAML 2.0 (auto-provisions users on first login)

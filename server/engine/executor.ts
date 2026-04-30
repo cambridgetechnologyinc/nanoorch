@@ -1,7 +1,7 @@
 import { storage } from "../storage";
 import { runAgent } from "../providers";
 import type { Provider, ProviderMessage, ToolDefinition } from "../providers";
-import type { Orchestrator, Agent } from "@shared/schema";
+import type { Orchestrator, Agent, CloudIntegration } from "@shared/schema";
 import { taskLogEmitter } from "./emitter";
 import { decrypt } from "../lib/encryption";
 import { executeCloudTool, type CloudCredentials } from "../cloud/executor";
@@ -15,21 +15,23 @@ import { dispatchCommsReply } from "../comms/comms-reply";
 import { dispatchApprovalCard } from "../comms/approval-cards";
 import { generateEmbedding } from "../lib/embeddings";
 import { estimateTokenCost } from "./token-cost";
+import { resolveProviderKey } from "../lib/resolve-provider-key";
+
+async function resolveApiKeyForOrchestrator(orchestrator: Orchestrator): Promise<string | null> {
+  // vllm with an explicit encrypted key stored on the orchestrator row takes priority
+  if (orchestrator.provider === "vllm" && (orchestrator as any).vllmApiKey) {
+    try { return decrypt((orchestrator as any).vllmApiKey); } catch { /* fall through */ }
+  }
+  // Workspace DB key → platform DB key → env var (via shared resolver)
+  return resolveProviderKey(orchestrator.provider, (orchestrator as any).workspaceId);
+}
 
 async function runAgentWithFailover(
   orchestrator: Orchestrator,
   options: Omit<Parameters<typeof runAgent>[0], "provider" | "model" | "baseUrl" | "apiKey">,
   log: (level: "info" | "warn" | "error", msg: string) => Promise<void>,
 ): Promise<Awaited<ReturnType<typeof runAgent>>> {
-  let primaryApiKey: string | null = null;
-  if (orchestrator.provider === "vllm" && (orchestrator as any).vllmApiKey) {
-    try {
-      const { decrypt } = await import("../lib/encryption");
-      primaryApiKey = decrypt((orchestrator as any).vllmApiKey);
-    } catch {
-      // If decryption fails (key changed), proceed without API key
-    }
-  }
+  const primaryApiKey = await resolveApiKeyForOrchestrator(orchestrator);
 
   try {
     return await runAgent({
@@ -54,6 +56,41 @@ async function runAgentWithFailover(
 }
 
 const MAX_TOOL_ROUNDS = 10;
+
+// ── Trace-span helpers (fire-and-forget; never throw) ─────────────────────────
+let _spanSeq = 0;
+async function openSpan(taskId: string, opts: {
+  spanType: string; name: string; parentSpanId?: string | null;
+  input?: unknown; metadata?: Record<string, unknown>;
+}): Promise<string | null> {
+  try {
+    const span = await storage.createTraceSpan({
+      taskId,
+      parentSpanId: opts.parentSpanId ?? null,
+      spanType: opts.spanType,
+      name: opts.name,
+      input: opts.input ?? null,
+      status: "running",
+      seq: ++_spanSeq,
+      metadata: (opts.metadata ?? null) as any,
+    });
+    return span.id;
+  } catch { return null; }
+}
+
+async function closeSpan(id: string | null, output?: unknown, status: "ok" | "error" = "ok", startedAt?: Date): Promise<void> {
+  if (!id) return;
+  try {
+    const endedAt = new Date();
+    const durationMs = startedAt ? endedAt.getTime() - startedAt.getTime() : null;
+    await storage.updateTraceSpan(id, {
+      status,
+      output: output ?? null,
+      endedAt,
+      durationMs: durationMs ?? undefined,
+    });
+  } catch { /* ignore */ }
+}
 
 export async function executeTask(taskId: string): Promise<void> {
   const task = await storage.getTask(taskId);
@@ -83,6 +120,14 @@ export async function executeTask(taskId: string): Promise<void> {
   const commsThread = task.commsThreadId
     ? await storage.getCommsThreadById(task.commsThreadId)
     : null;
+
+  const rootSpanId = await openSpan(taskId, {
+    spanType: "root",
+    name: `Task: ${task.input.slice(0, 80)}${task.input.length > 80 ? "…" : ""}`,
+    input: { input: task.input, intent: task.intent },
+    metadata: { provider: orchestrator.provider, model: orchestrator.model },
+  });
+  const taskStartedAt = new Date();
 
   try {
     await log("info", `Task started — provider: ${orchestrator.provider}, model: ${orchestrator.model}`);
@@ -116,7 +161,8 @@ export async function executeTask(taskId: string): Promise<void> {
         messages.push({ role: "system", content: `Agent memory:\n${memStr}` });
       }
       try {
-        const queryEmb = await generateEmbedding(task.input);
+        const embApiKey = await resolveProviderKey(orchestrator.provider, orchestrator.workspaceId);
+        const queryEmb = await generateEmbedding(task.input, { provider: orchestrator.provider, apiKey: embApiKey, baseUrl: orchestrator.baseUrl });
         if (queryEmb) {
           const vecMems = await storage.retrieveVectorMemories(agent.id, orchestrator.workspaceId, queryEmb, 5);
           const relevant = vecMems.filter((m) => m.similarity >= 0.70);
@@ -141,33 +187,48 @@ export async function executeTask(taskId: string): Promise<void> {
     let totalOutputTokens = 0;
     let approvalRequested = false;
 
+    let llmRound = 0;
     if (availableTools.length === 0) {
-      const result = await runAgentWithFailover(orchestrator, {
-        systemPrompt,
-        messages,
-        maxTokens: agent?.maxTokens ?? 4096,
-        temperature: agent?.temperature ?? 70,
-        onChunk: (chunk) => {
-          taskLogEmitter.emit(`task:${taskId}:stream`, chunk);
-        },
-      }, log);
-      output = result.content;
-      if (result.usage) {
-        totalInputTokens += result.usage.inputTokens;
-        totalOutputTokens += result.usage.outputTokens;
+      const llmSpanId = await openSpan(taskId, {
+        spanType: "llm_call", name: `LLM: ${orchestrator.provider}/${orchestrator.model}`,
+        parentSpanId: rootSpanId, input: { messageCount: messages.length },
+        metadata: { provider: orchestrator.provider, model: orchestrator.model },
+      });
+      const llmStart = new Date();
+      let llmErr: Error | null = null;
+      let llmOutput = "";
+      try {
+        const result = await runAgentWithFailover(orchestrator, {
+          systemPrompt, messages, maxTokens: agent?.maxTokens ?? 4096, temperature: agent?.temperature ?? 70,
+          onChunk: (chunk) => { taskLogEmitter.emit(`task:${taskId}:stream`, chunk); },
+        }, log);
+        output = result.content;
+        llmOutput = result.content;
+        if (result.usage) { totalInputTokens += result.usage.inputTokens; totalOutputTokens += result.usage.outputTokens; }
+      } catch (e: any) { llmErr = e; throw e; } finally {
+        await closeSpan(llmSpanId, llmErr ? { error: llmErr.message } : { output: llmOutput.slice(0, 200) },
+          llmErr ? "error" : "ok", llmStart);
       }
     } else {
       let toolRounds = 0;
       let done = false;
 
       while (!done && toolRounds < MAX_TOOL_ROUNDS) {
+        llmRound++;
+        const llmSpanId = await openSpan(taskId, {
+          spanType: "llm_call", name: `LLM round ${llmRound}: ${orchestrator.provider}/${orchestrator.model}`,
+          parentSpanId: rootSpanId, input: { messageCount: messages.length, toolCount: availableTools.length },
+          metadata: { provider: orchestrator.provider, model: orchestrator.model, round: llmRound },
+        });
+        const llmStart = new Date();
         const result = await runAgentWithFailover(orchestrator, {
-          systemPrompt,
-          messages,
-          maxTokens: agent?.maxTokens ?? 4096,
-          temperature: agent?.temperature ?? 70,
+          systemPrompt, messages, maxTokens: agent?.maxTokens ?? 4096, temperature: agent?.temperature ?? 70,
           tools: availableTools,
-        }, log);
+        }, log).catch(async (e) => { await closeSpan(llmSpanId, { error: e.message }, "error", llmStart); throw e; });
+        await closeSpan(llmSpanId, {
+          toolCalls: result.toolCalls?.length ?? 0, hasContent: Boolean(result.content),
+          usage: result.usage,
+        }, "ok", llmStart);
 
         if (result.usage) {
           totalInputTokens += result.usage.inputTokens;
@@ -258,10 +319,18 @@ export async function executeTask(taskId: string): Promise<void> {
           const safeArgs = sanitizeToolArgs(toolCall.arguments);
           await log("info", `Calling tool: ${toolCall.name}`, { args: safeArgs });
 
+          const toolSpanId = await openSpan(taskId, {
+            spanType: "tool_call", name: toolCall.name,
+            parentSpanId: rootSpanId, input: safeArgs,
+            metadata: { provider: cloudProvider },
+          });
+          const toolStart = new Date();
+
           const matchedCred = cloudCreds.find((c) => c.provider === cloudProvider);
           if (!matchedCred) {
             const errMsg = `No active ${cloudProvider} integration found for this workspace`;
             await log("warn", errMsg);
+            await closeSpan(toolSpanId, { error: errMsg }, "error", toolStart);
             messages.push({ role: "user", content: `Tool ${toolCall.name} result: ERROR — ${errMsg}` });
             continue;
           }
@@ -271,10 +340,12 @@ export async function executeTask(taskId: string): Promise<void> {
             await storage.touchCloudIntegration(matchedCred.integrationId);
             const resultStr = JSON.stringify(toolResult, null, 2);
             await log("info", `Tool ${toolCall.name} completed`, { resultLength: resultStr.length });
+            await closeSpan(toolSpanId, toolResult, "ok", toolStart);
             messages.push({ role: "user", content: `Tool ${toolCall.name} result:\n${resultStr}` });
           } catch (toolErr: any) {
             const errMsg = toolErr?.message ?? String(toolErr);
             await log("error", `Tool ${toolCall.name} failed: ${errMsg}`);
+            await closeSpan(toolSpanId, { error: errMsg }, "error", toolStart);
             messages.push({ role: "user", content: `Tool ${toolCall.name} result: ERROR — ${errMsg}` });
           }
         }
@@ -354,7 +425,8 @@ export async function executeTask(taskId: string): Promise<void> {
 
     if (agent?.memoryEnabled && agent) {
       await storage.setAgentMemory(agent.id, "last_task_output", output.slice(0, 500));
-      generateEmbedding(output.slice(0, 4000))
+      resolveProviderKey(orchestrator.provider, orchestrator.workspaceId)
+        .then((embKey) => generateEmbedding(output.slice(0, 4000), { provider: orchestrator.provider, apiKey: embKey, baseUrl: orchestrator.baseUrl }))
         .then((emb) => {
           if (emb) {
             storage.storeVectorMemory(agent.id, orchestrator.workspaceId, output, emb, "task_output", taskId).catch(() => {});
@@ -363,6 +435,7 @@ export async function executeTask(taskId: string): Promise<void> {
         .catch(() => {});
     }
 
+    await closeSpan(rootSpanId, { output: output.slice(0, 500), chars: output.length }, "ok", taskStartedAt);
     await storage.updateTask(taskId, {
       status: "completed",
       output,
@@ -443,8 +516,13 @@ export async function executeTask(taskId: string): Promise<void> {
 
     dispatchNotification(orchestrator.id, "task.completed", {
       taskId,
+      agentId: agent?.id,
       agentName: agent?.name,
+      status: "completed",
+      input: task.input.slice(0, 4000),
+      output,
       summary: output.slice(0, 300),
+      completedAt: new Date().toISOString(),
     }).catch(console.error);
 
     if (task.commsThreadId) {
@@ -453,6 +531,7 @@ export async function executeTask(taskId: string): Promise<void> {
   } catch (err: any) {
     const message = err?.message ?? String(err);
     await log("error", `Task failed: ${message}`);
+    await closeSpan(rootSpanId, { error: message }, "error", taskStartedAt);
 
     const retryCount = (task as any).retryCount ?? 0;
     const maxRetries = orchestrator.maxRetries ?? 2;
@@ -495,147 +574,75 @@ export async function executeTask(taskId: string): Promise<void> {
       taskLogEmitter.emit(`task:${taskId}`, { type: "done", status: "failed" });
       dispatchNotification(orchestrator.id, "task.failed", {
         taskId,
+        agentId: agent?.id,
         agentName: agent?.name,
+        status: "failed",
+        input: task.input.slice(0, 4000),
         error: message,
+        completedAt: new Date().toISOString(),
       }).catch(console.error);
     }
   }
 }
 
-type LoadedCredential = CloudCredentials & { integrationId: string };
+export type LoadedCredential = CloudCredentials & { integrationId: string };
+
+/**
+ * Converts a pre-filtered list of CloudIntegration rows into LoadedCredential objects.
+ * Exported so the chat route (and any future callers) can reuse the same logic — add
+ * new providers here once and they automatically work everywhere.
+ */
+export async function loadCredentialsFromIntegrations(
+  integrations: CloudIntegration[],
+  log?: (level: "info" | "warn" | "error", msg: string) => Promise<void>
+): Promise<LoadedCredential[]> {
+  const loaded: LoadedCredential[] = [];
+
+  for (const integration of integrations) {
+    try {
+      const raw = JSON.parse(decrypt(integration.credentialsEncrypted));
+
+      if (integration.provider === "aws") {
+        loaded.push({ integrationId: integration.id, provider: "aws", credentials: { accessKeyId: raw.accessKeyId, secretAccessKey: raw.secretAccessKey, region: raw.region } });
+      } else if (integration.provider === "gcp") {
+        loaded.push({ integrationId: integration.id, provider: "gcp", credentials: { serviceAccountJson: raw } });
+      } else if (integration.provider === "azure") {
+        loaded.push({ integrationId: integration.id, provider: "azure", credentials: { clientId: raw.clientId, clientSecret: raw.clientSecret, tenantId: raw.tenantId, subscriptionId: raw.subscriptionId } });
+      } else if (integration.provider === "ragflow") {
+        loaded.push({ integrationId: integration.id, provider: "ragflow", credentials: { baseUrl: raw.baseUrl, apiKey: raw.apiKey } });
+      } else if (integration.provider === "jira") {
+        loaded.push({ integrationId: integration.id, provider: "jira", credentials: { baseUrl: raw.baseUrl, email: raw.email, apiToken: raw.apiToken, defaultProjectKey: raw.defaultProjectKey, tokenType: raw.tokenType } });
+      } else if (integration.provider === "github") {
+        loaded.push({ integrationId: integration.id, provider: "github", credentials: { token: raw.token, defaultOwner: raw.defaultOwner } });
+      } else if (integration.provider === "gitlab") {
+        loaded.push({ integrationId: integration.id, provider: "gitlab", credentials: { baseUrl: raw.baseUrl, token: raw.token, defaultProjectId: raw.defaultProjectId } });
+      } else if (integration.provider === "teams") {
+        loaded.push({ integrationId: integration.id, provider: "teams", credentials: { webhookUrl: raw.webhookUrl } });
+      } else if (integration.provider === "slack") {
+        loaded.push({ integrationId: integration.id, provider: "slack", credentials: { botToken: raw.botToken, defaultChannel: raw.defaultChannel } });
+      } else if (integration.provider === "google_chat") {
+        loaded.push({ integrationId: integration.id, provider: "google_chat", credentials: { webhookUrl: raw.webhookUrl } });
+      } else if (integration.provider === "servicenow") {
+        loaded.push({ integrationId: integration.id, provider: "servicenow", credentials: { instanceUrl: raw.instanceUrl, username: raw.username, password: raw.password } });
+      } else if (integration.provider === "postgresql") {
+        loaded.push({ integrationId: integration.id, provider: "postgresql", credentials: { connectionString: raw.connectionString } });
+      } else if (integration.provider === "kubernetes") {
+        loaded.push({ integrationId: integration.id, provider: "kubernetes", credentials: { apiServer: raw.apiServer, bearerToken: raw.bearerToken, caCertBase64: raw.caCertBase64, insecureSkipTlsVerify: raw.insecureSkipTlsVerify, kubeconfigJson: raw.kubeconfigJson, defaultNamespace: raw.defaultNamespace } });
+      }
+    } catch {
+      if (log) await log("warn", `Failed to load credentials for integration "${integration.name}" — skipping`);
+    }
+  }
+
+  return loaded;
+}
 
 async function loadCloudCredentials(
   workspaceId: string,
   log: (level: "info" | "warn" | "error", msg: string) => Promise<void>
 ): Promise<LoadedCredential[]> {
   const integrations = await storage.getCloudIntegrationsForWorkspace(workspaceId);
-  const loaded: LoadedCredential[] = [];
-
-  for (const integration of integrations) {
-    try {
-      const decrypted = decrypt(integration.credentialsEncrypted);
-      const raw = JSON.parse(decrypted);
-
-      if (integration.provider === "aws") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "aws",
-          credentials: {
-            accessKeyId: raw.accessKeyId,
-            secretAccessKey: raw.secretAccessKey,
-            region: raw.region,
-          },
-        });
-      } else if (integration.provider === "gcp") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "gcp",
-          credentials: { serviceAccountJson: raw },
-        });
-      } else if (integration.provider === "azure") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "azure",
-          credentials: {
-            clientId: raw.clientId,
-            clientSecret: raw.clientSecret,
-            tenantId: raw.tenantId,
-            subscriptionId: raw.subscriptionId,
-          },
-        });
-      } else if (integration.provider === "ragflow") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "ragflow",
-          credentials: {
-            baseUrl: raw.baseUrl,
-            apiKey: raw.apiKey,
-          },
-        });
-      } else if (integration.provider === "jira") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "jira",
-          credentials: {
-            baseUrl: raw.baseUrl,
-            email: raw.email,
-            apiToken: raw.apiToken,
-            defaultProjectKey: raw.defaultProjectKey,
-          },
-        });
-      } else if (integration.provider === "github") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "github",
-          credentials: {
-            token: raw.token,
-            defaultOwner: raw.defaultOwner,
-          },
-        });
-      } else if (integration.provider === "gitlab") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "gitlab",
-          credentials: {
-            baseUrl: raw.baseUrl,
-            token: raw.token,
-            defaultProjectId: raw.defaultProjectId,
-          },
-        });
-      } else if (integration.provider === "teams") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "teams",
-          credentials: { webhookUrl: raw.webhookUrl },
-        });
-      } else if (integration.provider === "slack") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "slack",
-          credentials: { botToken: raw.botToken, defaultChannel: raw.defaultChannel },
-        });
-      } else if (integration.provider === "google_chat") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "google_chat",
-          credentials: { webhookUrl: raw.webhookUrl },
-        });
-      } else if (integration.provider === "servicenow") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "servicenow",
-          credentials: {
-            instanceUrl: raw.instanceUrl,
-            username: raw.username,
-            password: raw.password,
-          },
-        });
-      } else if (integration.provider === "postgresql") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "postgresql",
-          credentials: { connectionString: raw.connectionString },
-        });
-      } else if (integration.provider === "kubernetes") {
-        loaded.push({
-          integrationId: integration.id,
-          provider: "kubernetes",
-          credentials: {
-            apiServer: raw.apiServer,
-            bearerToken: raw.bearerToken,
-            caCertBase64: raw.caCertBase64,
-            insecureSkipTlsVerify: raw.insecureSkipTlsVerify,
-            kubeconfigJson: raw.kubeconfigJson,
-            defaultNamespace: raw.defaultNamespace,
-          },
-        });
-      }
-    } catch {
-      await log("warn", `Failed to load credentials for integration "${integration.name}" — skipping`);
-    }
-  }
-
-  return loaded;
+  return loadCredentialsFromIntegrations(integrations, log);
 }
 
 function buildToolList(creds: LoadedCredential[], includeCodeInterpreter = false, agents: Agent[] = []): ToolDefinition[] {

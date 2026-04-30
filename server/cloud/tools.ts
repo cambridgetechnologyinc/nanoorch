@@ -740,6 +740,39 @@ const PG_APPROVAL_NOTE =
   "IMPORTANT: You MUST call request_approval before using this tool — this operation modifies or drops data and requires human approval.";
 
 export const POSTGRESQL_TOOLS: ToolDefinition[] = [
+  {
+    name: "pg_list_databases",
+    description: "List all databases on the connected PostgreSQL server (excludes template databases). Returns database name, size, encoding, and collation.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "pg_create_database",
+    description: "Create a new PostgreSQL database on the connected server. Requires CREATEDB or SUPERUSER privilege. " + PG_APPROVAL_NOTE,
+    parameters: {
+      type: "object",
+      properties: {
+        database: { type: "string", description: "Name of the new database to create." },
+        owner: { type: "string", description: "Role name that will own the new database (default: current user)." },
+        template: { type: "string", description: "Template database to copy from. Use 'template0' for custom encoding/collation (default: template1)." },
+        encoding: { type: "string", description: "Character encoding, e.g. 'UTF8' (default: server default)." },
+        lc_collate: { type: "string", description: "Collation order, e.g. 'en_US.UTF-8'. Only settable when template=template0." },
+        lc_ctype: { type: "string", description: "Character classification, e.g. 'en_US.UTF-8'. Only settable when template=template0." },
+      },
+      required: ["database"],
+    },
+  },
+  {
+    name: "pg_drop_database",
+    description: "Drop (permanently delete) a PostgreSQL database and all of its objects. This is irreversible. Cannot drop the currently connected database. " + PG_APPROVAL_NOTE,
+    parameters: {
+      type: "object",
+      properties: {
+        database: { type: "string", description: "Name of the database to drop." },
+        force: { type: "string", description: "Terminate all existing connections and drop anyway? 'true' or 'false' (default: false). Requires PostgreSQL 13+." },
+      },
+      required: ["database"],
+    },
+  },
   // ── Original 5 tools ──────────────────────────────────────────────────────
   {
     name: "pg_list_schemas",

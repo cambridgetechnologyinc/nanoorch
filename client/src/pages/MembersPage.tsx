@@ -38,7 +38,7 @@ export default function MembersPage({ workspaceId }: MembersPageProps) {
   const { data: members = [], isLoading } = useQuery<WorkspaceMember[]>({
     queryKey: ["/api/workspaces", workspaceId, "members"],
     queryFn: async () => {
-      const res = await fetch(`/api/workspaces/${workspaceId}/members`);
+      const res = await fetch(`/api/workspaces/${workspaceId}/members`, { credentials: "include" });
       return res.json();
     },
   });

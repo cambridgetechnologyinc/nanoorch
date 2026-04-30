@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   Plus, Radio, Webhook, Key, Copy, Check, Trash2, ToggleLeft, ToggleRight,
-  Send, History, Loader2, CheckCircle2, XCircle, AlertCircle, ExternalLink, Grid2X2, Pencil,
+  Send, History, Loader2, CheckCircle2, XCircle, AlertCircle, ExternalLink, Grid2X2, Pencil, Mail,
 } from "lucide-react";
 import { SiSlack, SiGooglechat } from "react-icons/si";
 import { Button } from "@/components/ui/button";
@@ -22,10 +22,10 @@ import type { Channel, ChannelDelivery } from "@shared/schema";
 
 interface Props { orchestratorId: string; workspaceId?: string; }
 
-type ChannelType = "api" | "webhook" | "slack" | "teams" | "google_chat" | "generic_webhook";
+type ChannelType = "api" | "webhook" | "slack" | "teams" | "google_chat" | "generic_webhook" | "email";
 
 const OUTBOUND_TYPES: ChannelType[] = ["slack", "teams", "google_chat", "generic_webhook"];
-const INBOUND_TYPES: ChannelType[] = ["api", "webhook"];
+const INBOUND_TYPES: ChannelType[] = ["api", "webhook", "email"];
 
 const AVAILABLE_EVENTS = [
   { value: "task.completed", label: "Task Completed" },
@@ -40,6 +40,7 @@ const TYPE_META: Record<ChannelType, { label: string; icon: React.ReactNode; col
   teams:           { label: "Teams",          icon: <Grid2X2 className="w-4 h-4" />,                           color: "bg-indigo-500/10 text-indigo-400 border-indigo-500/30" },
   google_chat:     { label: "Google Chat",    icon: <SiGooglechat className="w-4 h-4" />,                      color: "bg-red-500/10 text-red-400 border-red-500/30" },
   generic_webhook: { label: "Generic Webhook",icon: <ExternalLink className="w-4 h-4" />,                      color: "bg-orange-500/10 text-orange-400 border-orange-500/30" },
+  email:           { label: "Email",          icon: <Mail className="w-4 h-4" />,                              color: "bg-teal-500/10 text-teal-400 border-teal-500/30" },
 };
 
 const URL_PLACEHOLDERS: Record<string, string> = {
@@ -115,6 +116,8 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
         config = { isInbound: true, appId: data.appId, appPassword: data.appPassword, defaultAgentId: data.defaultAgentId || undefined, ...(allowedUsers.length ? { allowedUsers } : {}) };
       } else if (data.isInbound && data.type === "google_chat") {
         config = { isInbound: true, verificationToken: data.verificationToken || undefined, defaultAgentId: data.defaultAgentId || undefined, ...(allowedUsers.length ? { allowedUsers } : {}) };
+      } else if (data.type === "email") {
+        config = { agentId: data.defaultAgentId || undefined };
       } else if (OUTBOUND_TYPES.includes(data.type)) {
         config = { url: data.url, events: data.events, ...(data.secret ? { secret: data.secret } : {}) };
       }
@@ -140,7 +143,8 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
       } else if (data.isInbound && data.type === "google_chat") {
         config = { isInbound: true, verificationToken: data.verificationToken || undefined, defaultAgentId: data.defaultAgentId || undefined, ...(allowedUsers.length ? { allowedUsers } : {}) };
       } else if (OUTBOUND_TYPES.includes(data.type)) {
-        config = { url: data.url, events: data.events, ...(data.secret ? { secret: data.secret } : {}) };
+        const existingSecret = ((editChannel?.config ?? {}) as Record<string, unknown>).secret as string | undefined;
+        config = { url: data.url, events: data.events, ...(data.secret ? { secret: data.secret } : existingSecret ? { secret: existingSecret } : {}) };
       }
       return apiRequest("PUT", `/api/channels/${editChannel!.id}`, { name: data.name, config });
     },
@@ -204,7 +208,10 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
     setTimeout(() => setCopied(null), 2000);
   };
 
-  const getWebhookUrl = (ch: Channel) => `${window.location.origin}/api/channels/${ch.id}/webhook`;
+  const getWebhookUrl = (ch: Channel) =>
+    ch.type === "email"
+      ? `${window.location.origin}/api/email/inbound/${ch.id}`
+      : `${window.location.origin}/api/channels/${ch.id}/webhook`;
 
   const toggleEvent = (ev: string) => {
     setForm((f) => ({
@@ -343,6 +350,7 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
                 <SelectContent>
                   <SelectItem value="api">API (inbound)</SelectItem>
                   <SelectItem value="webhook">Webhook (inbound)</SelectItem>
+                  <SelectItem value="email">Email (inbound)</SelectItem>
                   <SelectItem value="slack">Slack</SelectItem>
                   <SelectItem value="teams">Microsoft Teams</SelectItem>
                   <SelectItem value="google_chat">Google Chat (outbound)</SelectItem>
@@ -449,6 +457,30 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
               </>
             )}
 
+            {form.type === "email" && (
+              <>
+                <div className="rounded-lg border border-teal-500/30 bg-teal-500/5 p-3 space-y-1">
+                  <p className="text-xs font-semibold text-teal-400 flex items-center gap-1.5">
+                    <Mail className="w-3.5 h-3.5" /> Email Inbound Setup
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    After creating this channel, configure your email provider (SendGrid, Postmark, or Mailgun) to forward
+                    inbound emails via HTTP POST to the webhook URL shown on the channel card.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    NanoOrch will auto-detect the provider format and route the email to the selected agent.
+                  </p>
+                </div>
+                <div>
+                  <Label>Route to Agent <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                  <Input value={form.defaultAgentId}
+                    onChange={(e) => setForm({ ...form, defaultAgentId: e.target.value })}
+                    placeholder="Agent ID — leave blank to use orchestrator default" className="mt-1 font-mono text-xs" data-testid="input-email-agent-id" />
+                  <p className="text-xs text-muted-foreground mt-1">All inbound emails on this channel will be routed to this agent.</p>
+                </div>
+              </>
+            )}
+
             {isOutboundForm && (
               <>
                 <div>
@@ -464,7 +496,7 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
                     {form.type === "slack" && "Create one at Slack → Apps → Incoming Webhooks"}
                     {form.type === "teams" && "Create one at Teams → channel → Connectors → Incoming Webhook"}
                     {form.type === "google_chat" && "Create one at Google Chat → Space settings → Apps & integrations"}
-                    {form.type === "generic_webhook" && "Your service must accept a JSON POST body"}
+                    {form.type === "generic_webhook" && "Your service must accept a JSON POST body. Task results include event, status, taskId, agentName, input, output/error, and timestamp."}
                   </p>
                 </div>
                 <div>
@@ -494,6 +526,7 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
                     className="mt-1"
                     data-testid="input-channel-secret"
                   />
+                  <p className="text-xs text-muted-foreground mt-1">When set, NanoOrch signs requests with <code className="bg-muted px-1 rounded">X-NanoOrch-Signature-256</code>.</p>
                 </div>
               </>
             )}
@@ -650,6 +683,7 @@ export default function ChannelsPage({ orchestratorId, workspaceId }: Props) {
                   <Input type="password" value={editForm.secret}
                     onChange={(e) => setEditForm({ ...editForm, secret: e.target.value })}
                     placeholder="Leave blank to keep existing" className="mt-1" data-testid="input-edit-channel-secret" />
+                  <p className="text-xs text-muted-foreground mt-1">When set, NanoOrch signs requests with <code className="bg-muted px-1 rounded">X-NanoOrch-Signature-256</code>.</p>
                 </div>
               </>
             )}

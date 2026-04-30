@@ -5,17 +5,65 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Legend, ReferenceLine,
 } from "recharts";
-import { BarChart2, Zap, DollarSign, Activity, TrendingUp, Bell } from "lucide-react";
+import {
+  BarChart2, Zap, DollarSign, Activity, TrendingUp, Bell,
+  Shield, Key, Copy, Trash2, Plus, CheckCircle, Settings2, TrendingDown,
+} from "lucide-react";
 import { useState, useMemo, useEffect } from "react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { format } from "date-fns";
+import { cn } from "@/lib/utils";
 
 interface ObservabilityPageProps {
   workspaceId: string;
+}
+
+interface AgentPerf {
+  agentId: string;
+  agentName: string;
+  totalRuns: number;
+  completed: number;
+  failed: number;
+  avgDurationMs: number | null;
+  p95DurationMs: number | null;
+  successRate: number;
+}
+
+interface TaskTrendDay {
+  date: string;
+  completed: number;
+  failed: number;
+  total: number;
+}
+
+interface QuotaData {
+  quota: {
+    monthlyTokenLimit: number | null;
+    dailyTokenLimit: number | null;
+    monthlyCostLimitCents: number | null;
+    alertThresholdPct: number;
+    enforcement: string;
+  } | null;
+  usage: { totalTokens: number; estimatedCostCents: number };
+}
+
+interface ApiKey {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  scopes: string[];
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  createdAt: string;
 }
 
 interface ObsStats {
@@ -117,16 +165,36 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   );
 };
 
+function fmsDuration(ms: number | null) {
+  if (ms == null) return "—";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 export default function ObservabilityPage({ workspaceId }: ObservabilityPageProps) {
   const { toast } = useToast();
   const [days, setDays] = useState("30");
   const [alertThreshold, setAlertThreshold] = useState("");
   const [alertChannelId, setAlertChannelId] = useState("none");
 
+  // Quota state
+  const [quotaOpen, setQuotaOpen] = useState(false);
+  const [quotaForm, setQuotaForm] = useState({
+    monthlyTokenLimit: "",
+    dailyTokenLimit: "",
+    alertThresholdPct: "80",
+    enforcement: "warn",
+  });
+
+  // API key state
+  const [newKeyName, setNewKeyName] = useState("");
+  const [newKeySecret, setNewKeySecret] = useState<string | null>(null);
+
   const { data: stats, isLoading } = useQuery<ObsStats>({
     queryKey: [`/api/workspaces/${workspaceId}/observability`, days],
     queryFn: async () => {
       const res = await fetch(`/api/workspaces/${workspaceId}/observability?days=${days}`, { credentials: "include" });
+      if (!res.ok) throw new Error(`${res.status}`);
       return res.json();
     },
   });
@@ -160,6 +228,96 @@ export default function ObservabilityPage({ workspaceId }: ObservabilityPageProp
       toast({ title: "Alert settings saved" });
     },
     onError: () => toast({ title: "Failed to save settings", variant: "destructive" }),
+  });
+
+  // ── Agent Performance Analytics ──────────────────────────────────────────────
+  const { data: agentPerf = [] } = useQuery<AgentPerf[]>({
+    queryKey: [`/api/workspaces/${workspaceId}/analytics/agents`],
+    queryFn: async () => {
+      const res = await fetch(`/api/workspaces/${workspaceId}/analytics/agents`, { credentials: "include" });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const json = await res.json();
+      return Array.isArray(json) ? json : [];
+    },
+    refetchInterval: 30_000,
+  });
+
+  const { data: taskTrend = [] } = useQuery<TaskTrendDay[]>({
+    queryKey: [`/api/workspaces/${workspaceId}/analytics/task-trend`],
+    queryFn: async () => {
+      const res = await fetch(`/api/workspaces/${workspaceId}/analytics/task-trend?days=14`, { credentials: "include" });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const json = await res.json();
+      return Array.isArray(json) ? json : [];
+    },
+    refetchInterval: 30_000,
+  });
+
+  // ── Quota ─────────────────────────────────────────────────────────────────────
+  const { data: quotaData } = useQuery<QuotaData>({
+    queryKey: [`/api/workspaces/${workspaceId}/quota`],
+    queryFn: async () => {
+      const res = await fetch(`/api/workspaces/${workspaceId}/quota`, { credentials: "include" });
+      if (!res.ok) throw new Error(`${res.status}`);
+      return res.json();
+    },
+  });
+
+  useEffect(() => {
+    if (quotaData?.quota) {
+      setQuotaForm({
+        monthlyTokenLimit: quotaData.quota.monthlyTokenLimit != null ? String(quotaData.quota.monthlyTokenLimit) : "",
+        dailyTokenLimit: quotaData.quota.dailyTokenLimit != null ? String(quotaData.quota.dailyTokenLimit) : "",
+        alertThresholdPct: String(quotaData.quota.alertThresholdPct),
+        enforcement: quotaData.quota.enforcement,
+      });
+    }
+  }, [quotaData]);
+
+  const saveQuotaMutation = useMutation({
+    mutationFn: () => apiRequest("PUT", `/api/workspaces/${workspaceId}/quota`, {
+      monthlyTokenLimit: quotaForm.monthlyTokenLimit ? parseInt(quotaForm.monthlyTokenLimit) : null,
+      dailyTokenLimit: quotaForm.dailyTokenLimit ? parseInt(quotaForm.dailyTokenLimit) : null,
+      alertThresholdPct: parseInt(quotaForm.alertThresholdPct) || 80,
+      enforcement: quotaForm.enforcement,
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [`/api/workspaces/${workspaceId}/quota`] });
+      setQuotaOpen(false);
+      toast({ title: "Quota settings saved" });
+    },
+    onError: () => toast({ title: "Failed to save quota", variant: "destructive" }),
+  });
+
+  // ── API Keys ──────────────────────────────────────────────────────────────────
+  const { data: apiKeys = [] } = useQuery<ApiKey[]>({
+    queryKey: [`/api/workspaces/${workspaceId}/api-keys`],
+    queryFn: async () => {
+      const res = await fetch(`/api/workspaces/${workspaceId}/api-keys`, { credentials: "include" });
+      if (!res.ok) throw new Error(`${res.status}`);
+      const json = await res.json();
+      return Array.isArray(json) ? json : [];
+    },
+  });
+
+  const createKeyMutation = useMutation({
+    mutationFn: () => apiRequest("POST", `/api/workspaces/${workspaceId}/api-keys`, { name: newKeyName }),
+    onSuccess: async (res: any) => {
+      const data = await res.json();
+      setNewKeySecret(data.key);
+      setNewKeyName("");
+      queryClient.invalidateQueries({ queryKey: [`/api/workspaces/${workspaceId}/api-keys`] });
+    },
+    onError: () => toast({ title: "Failed to create API key", variant: "destructive" }),
+  });
+
+  const revokeKeyMutation = useMutation({
+    mutationFn: (id: string) => apiRequest("DELETE", `/api/workspaces/${workspaceId}/api-keys/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [`/api/workspaces/${workspaceId}/api-keys`] });
+      toast({ title: "API key revoked" });
+    },
+    onError: () => toast({ title: "Failed to revoke key", variant: "destructive" }),
   });
 
   const totalTokens = (stats?.totalInputTokens ?? 0) + (stats?.totalOutputTokens ?? 0);
@@ -402,7 +560,304 @@ export default function ObservabilityPage({ workspaceId }: ObservabilityPageProp
         </>
       )}
 
-      {/* Utilization Alert Settings */}
+      {/* ── Task Trend Chart ────────────────────────────────────────────────── */}
+      {taskTrend.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-primary" />
+              Task Trend (Last 14 Days)
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={taskTrend} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+                <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend />
+                <Bar dataKey="completed" name="Completed" stackId="a" fill="#10b981" radius={[0, 0, 0, 0]} />
+                <Bar dataKey="failed" name="Failed" stackId="a" fill="#ef4444" radius={[2, 2, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── Agent Task Performance ───────────────────────────────────────────── */}
+      {agentPerf.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base flex items-center gap-2">
+              <Activity className="w-4 h-4 text-primary" />
+              Agent Task Performance
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/30">
+                    <th className="text-left px-4 py-2.5 font-medium text-muted-foreground text-xs">Agent</th>
+                    <th className="text-right px-4 py-2.5 font-medium text-muted-foreground text-xs">Runs</th>
+                    <th className="text-right px-4 py-2.5 font-medium text-muted-foreground text-xs">Success Rate</th>
+                    <th className="text-right px-4 py-2.5 font-medium text-muted-foreground text-xs">Avg Duration</th>
+                    <th className="text-right px-4 py-2.5 font-medium text-muted-foreground text-xs">p95 Duration</th>
+                    <th className="text-right px-4 py-2.5 font-medium text-muted-foreground text-xs">Errors</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {agentPerf.map((a, i) => (
+                    <tr key={a.agentId} className="border-b last:border-0 hover:bg-muted/20 transition-colors" data-testid={`row-agentperf-${i}`}>
+                      <td className="px-4 py-2.5 font-medium">{a.agentName}</td>
+                      <td className="px-4 py-2.5 text-right text-muted-foreground">{a.totalRuns}</td>
+                      <td className="px-4 py-2.5 text-right">
+                        <span className={cn("font-medium", a.successRate >= 90 ? "text-green-500" : a.successRate >= 70 ? "text-yellow-500" : "text-red-500")}>
+                          {a.successRate}%
+                        </span>
+                      </td>
+                      <td className="px-4 py-2.5 text-right text-muted-foreground font-mono text-xs">{fmsDuration(a.avgDurationMs)}</td>
+                      <td className="px-4 py-2.5 text-right text-muted-foreground font-mono text-xs">{fmsDuration(a.p95DurationMs)}</td>
+                      <td className="px-4 py-2.5 text-right">
+                        {a.failed > 0
+                          ? <span className="text-red-400 font-medium">{a.failed}</span>
+                          : <span className="text-muted-foreground">0</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── Usage Quota Governance ───────────────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Shield className="w-4 h-4 text-primary" />
+              Usage Quota
+            </CardTitle>
+            <Dialog open={quotaOpen} onOpenChange={setQuotaOpen}>
+              <DialogTrigger asChild>
+                <Button variant="outline" size="sm" className="gap-1.5 h-8" data-testid="button-edit-quota">
+                  <Settings2 className="w-3.5 h-3.5" /> Edit Limits
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Workspace Usage Quota</DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4 py-2">
+                  <div className="space-y-1.5">
+                    <Label>Monthly Token Limit (0 = unlimited)</Label>
+                    <Input
+                      type="number"
+                      placeholder="e.g. 10000000"
+                      value={quotaForm.monthlyTokenLimit}
+                      onChange={(e) => setQuotaForm((f) => ({ ...f, monthlyTokenLimit: e.target.value }))}
+                      data-testid="input-monthly-token-limit"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Daily Token Limit (0 = unlimited)</Label>
+                    <Input
+                      type="number"
+                      placeholder="e.g. 500000"
+                      value={quotaForm.dailyTokenLimit}
+                      onChange={(e) => setQuotaForm((f) => ({ ...f, dailyTokenLimit: e.target.value }))}
+                      data-testid="input-daily-token-limit"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Alert Threshold (%)</Label>
+                      <Input
+                        type="number"
+                        min="1"
+                        max="100"
+                        value={quotaForm.alertThresholdPct}
+                        onChange={(e) => setQuotaForm((f) => ({ ...f, alertThresholdPct: e.target.value }))}
+                        data-testid="input-alert-threshold-pct"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Enforcement</Label>
+                      <Select value={quotaForm.enforcement} onValueChange={(v) => setQuotaForm((f) => ({ ...f, enforcement: v }))}>
+                        <SelectTrigger data-testid="select-enforcement">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="warn">Warn only</SelectItem>
+                          <SelectItem value="block">Block tasks</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setQuotaOpen(false)}>Cancel</Button>
+                  <Button onClick={() => saveQuotaMutation.mutate()} disabled={saveQuotaMutation.isPending}>
+                    {saveQuotaMutation.isPending ? "Saving…" : "Save Quota"}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {quotaData ? (
+            <div className="space-y-4">
+              <div>
+                <div className="flex items-center justify-between text-sm mb-1.5">
+                  <span className="text-muted-foreground">Monthly token usage</span>
+                  <span className="font-mono text-xs">
+                    {fmt(quotaData.usage.totalTokens)}
+                    {quotaData.quota?.monthlyTokenLimit ? ` / ${fmt(quotaData.quota.monthlyTokenLimit)}` : " / Unlimited"}
+                  </span>
+                </div>
+                {quotaData.quota?.monthlyTokenLimit ? (
+                  <Progress
+                    value={Math.min(100, (quotaData.usage.totalTokens / quotaData.quota.monthlyTokenLimit) * 100)}
+                    className="h-2"
+                    data-testid="progress-monthly-tokens"
+                  />
+                ) : (
+                  <div className="h-2 rounded-full bg-muted/40" />
+                )}
+              </div>
+              {quotaData.quota && (
+                <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+                  <span>Enforcement: <span className="font-medium text-foreground capitalize">{quotaData.quota.enforcement}</span></span>
+                  <span>Alert at: <span className="font-medium text-foreground">{quotaData.quota.alertThresholdPct}%</span></span>
+                  {quotaData.quota.dailyTokenLimit && (
+                    <span>Daily limit: <span className="font-medium text-foreground">{fmt(quotaData.quota.dailyTokenLimit)}</span></span>
+                  )}
+                </div>
+              )}
+              {!quotaData.quota && (
+                <p className="text-xs text-muted-foreground">No limits set — usage is unrestricted. Click "Edit Limits" to configure.</p>
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Loading quota data…</p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Platform API Keys ───────────────────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Key className="w-4 h-4 text-primary" />
+            Platform API Keys
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Create new key */}
+          <div className="flex gap-2">
+            <Input
+              placeholder="Key name (e.g. CI Deploy)"
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+              className="flex-1 h-9 text-sm"
+              data-testid="input-api-key-name"
+              onKeyDown={(e) => { if (e.key === "Enter" && newKeyName.trim()) createKeyMutation.mutate(); }}
+            />
+            <Button
+              size="sm"
+              className="h-9 gap-1.5"
+              disabled={!newKeyName.trim() || createKeyMutation.isPending}
+              onClick={() => createKeyMutation.mutate()}
+              data-testid="button-create-api-key"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Generate
+            </Button>
+          </div>
+
+          {/* Newly created key display */}
+          {newKeySecret && (
+            <div className="rounded-lg border border-green-500/30 bg-green-500/5 p-3 space-y-2">
+              <div className="flex items-center gap-1.5 text-green-400 text-xs font-medium">
+                <CheckCircle className="w-3.5 h-3.5" /> Key created — copy it now, it won't be shown again
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 text-xs font-mono bg-muted/50 rounded px-2 py-1.5 break-all" data-testid="text-new-api-key">
+                  {newKeySecret}
+                </code>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-8 w-8 shrink-0"
+                  onClick={() => { navigator.clipboard.writeText(newKeySecret); toast({ title: "Copied to clipboard" }); }}
+                  data-testid="button-copy-api-key"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 shrink-0"
+                  onClick={() => setNewKeySecret(null)}
+                >
+                  ✕
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Keys list */}
+          {!Array.isArray(apiKeys) || apiKeys.length === 0 ? (
+            <div className="text-center py-6 text-xs text-muted-foreground">
+              No API keys yet. Generate one above to enable programmatic access.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b">
+                    <th className="text-left py-2 font-medium text-muted-foreground text-xs">Name</th>
+                    <th className="text-left py-2 font-medium text-muted-foreground text-xs">Prefix</th>
+                    <th className="text-left py-2 font-medium text-muted-foreground text-xs">Created</th>
+                    <th className="text-left py-2 font-medium text-muted-foreground text-xs">Last Used</th>
+                    <th className="text-right py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {apiKeys.map((k, i) => (
+                    <tr key={k.id} className="border-b last:border-0" data-testid={`row-apikey-${i}`}>
+                      <td className="py-2 font-medium">{k.name}</td>
+                      <td className="py-2 font-mono text-xs text-muted-foreground">{k.keyPrefix}…</td>
+                      <td className="py-2 text-xs text-muted-foreground">{format(new Date(k.createdAt), "MMM d, yyyy")}</td>
+                      <td className="py-2 text-xs text-muted-foreground">
+                        {k.lastUsedAt ? format(new Date(k.lastUsedAt), "MMM d, yyyy") : "Never"}
+                      </td>
+                      <td className="py-2 text-right">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 text-muted-foreground hover:text-red-400"
+                          onClick={() => revokeKeyMutation.mutate(k.id)}
+                          disabled={revokeKeyMutation.isPending}
+                          data-testid={`button-revoke-key-${i}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Utilization Alert Settings ────────────────────────────────────────── */}
       <Card>
         <CardHeader>
           <CardTitle className="text-base flex items-center gap-2">

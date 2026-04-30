@@ -6,13 +6,12 @@ import connectPgSimple from "connect-pg-simple";
 import { RedisStore } from "connect-redis";
 import rateLimit from "express-rate-limit";
 import { getRedisClient, makeNodeRedisCompat, RedisRateLimitStore } from "./lib/redis";
-import { assertSafeUrl } from "./lib/ssrf-guard";
 import { storage } from "./storage";
 import { startQueueWorker } from "./engine/queue";
 import { taskLogEmitter } from "./engine/emitter";
 import { PROVIDER_MODELS, runAgent } from "./providers";
 import { insertWorkspaceSchema, insertOrchestratorSchema, insertAgentSchema, insertChannelSchema, insertTaskSchema } from "@shared/schema";
-import { randomUUID, createHash } from "crypto";
+import { randomUUID, createHash, createHmac } from "crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server";
 import { encrypt, decrypt } from "./lib/encryption";
@@ -21,7 +20,7 @@ import { getToolsForProvider, detectProviderFromToolName, CODE_INTERPRETER_TOOL,
 import type { ToolDefinition } from "./providers";
 import { AGENT_TEMPLATES } from "./lib/agent-templates";
 import { runCode } from "./engine/sandbox-executor";
-import { executeTask } from "./engine/executor";
+import { executeTask, loadCredentialsFromIntegrations } from "./engine/executor";
 import { generateEmbedding } from "./lib/embeddings";
 import { db, pool } from "./db";
 import { tasks } from "@shared/schema";
@@ -29,14 +28,16 @@ import { eq } from "drizzle-orm";
 import { hashPassword, verifyPassword, requireAuth, requireAdmin, requireWorkspaceAdmin } from "./lib/auth";
 import { computeNextRun, validateCron, registerJob, unregisterJob } from "./engine/scheduler";
 import { registerHeartbeatJob, unregisterHeartbeatJob, fireHeartbeatNow } from "./engine/heartbeat-scheduler";
-import { insertScheduledJobSchema } from "@shared/schema";
+import { insertScheduledJobSchema, insertJobQueueSchema } from "@shared/schema";
 import { executePipeline } from "./engine/pipeline-executor";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { loadSecret } from "./lib/secrets";
+import { resolveProviderKey } from "./lib/resolve-provider-key";
 import { handleSlackEvent, verifySlackSignature } from "./comms/slack-handler";
 import { handleTeamsEvent } from "./comms/teams-handler";
 import { handleGoogleChatEvent } from "./comms/google-chat-handler";
+import { handleEmailInbound } from "./comms/email-inbound-handler";
 import { createInferenceProxyRouter } from "./proxy/inference-proxy";
 import {
   processGitWebhook, verifyGitHubSignature, verifyGitLabSignature,
@@ -44,99 +45,25 @@ import {
 } from "./engine/git-agent-engine";
 import { insertGitAgentSchema, insertGitRepoSchema } from "@shared/schema";
 
-// ── Security helpers ──────────────────────────────────────────────────────────
-
-const TASK_STATUSES = new Set(["pending", "running", "completed", "failed"]);
-const APPROVAL_STATUSES = new Set(["pending", "approved", "rejected"]);
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function safeRedirectPath(url: string | undefined, fallback = "/workspaces"): string {
-  if (!url || typeof url !== "string") return fallback;
-  return url.startsWith("/") && !url.startsWith("//") ? url : fallback;
-}
-
-/** Extract the outbound URL from a stored integration credential (for SSRF validation). */
-function credentialBaseUrl(cred: { provider: string; credentials: any }): string | null {
-  const c = cred.credentials as Record<string, unknown>;
-  return (c?.baseUrl ?? c?.webhookUrl ?? c?.instanceUrl ?? null) as string | null;
-}
-
-/**
- * Validates the URL embedded in a credential object and returns a shallow copy
- * of that object with the URL reconstructed via the URL API.  Reconstruction
- * normalises the value and breaks SSRF taint chains that static analysis cannot
- * resolve through assertSafeUrl alone.
- */
-function sanitizeCredUrl(cred: { provider: string; credentials: any }): typeof cred {
-  const url = credentialBaseUrl(cred);
-  if (!url) return cred;
-  assertSafeUrl(url);
-  const safeUrl = new URL(url).href;
-  const c: Record<string, unknown> = { ...(cred.credentials as Record<string, unknown>) };
-  if (c.baseUrl !== undefined) c.baseUrl = safeUrl;
-  if (c.webhookUrl !== undefined) c.webhookUrl = safeUrl;
-  if (c.instanceUrl !== undefined) c.instanceUrl = safeUrl;
-  return { ...cred, credentials: c };
-}
-
-/** Return a sanitised task ID only if it looks like a UUID. Throws otherwise. */
-function safeTaskId(id: string): string {
-  if (!UUID_RE.test(id)) throw new Error(`Invalid task ID: ${id}`);
-  return id;
-}
-
-/** Generic UUID guard — use for any ID from request params / body before it reaches fetch. */
-function safeUUID(id: string, label = "ID"): string {
-  if (!UUID_RE.test(id)) throw new Error(`Invalid ${label}: ${id}`);
-  return id;
-}
-
-/**
- * Build the application origin (scheme + host) for use in OAuth/SAML callback
- * URLs. Prefers APP_URL env var so request headers (which can be spoofed) are
- * not used as the authoritative source in production.
- */
-function buildAppOrigin(): string {
-  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, "");
-  // Prefer Replit-provided env vars over request-derived headers to prevent
-  // Host-header spoofing in OAuth/SAML redirect URI construction.
-  const replitDomain = process.env.REPLIT_DOMAINS?.split(",")[0]?.trim();
-  if (replitDomain) return `https://${replitDomain}`;
-  // Development-only fallback — uses configured port, not request headers.
-  return `http://localhost:${process.env.PORT || "5000"}`;
-}
-
-// ── Provider key resolver (workspace key → global DB key → env var) ───────────
-async function resolveProviderApiKey(provider: string, workspaceId: string): Promise<string | null> {
-  // 1. Workspace-specific key (set by workspace admin)
-  const wsKey = await storage.getProviderKey(workspaceId, provider);
-  if (wsKey) {
-    try { return decrypt(wsKey.encryptedKey); } catch { /* fall through */ }
-  }
-  // 2. Global platform key (set by superadmin via console)
-  const globalKey = await storage.getProviderKey(null, provider);
-  if (globalKey) {
-    try { return decrypt(globalKey.encryptedKey); } catch { /* fall through */ }
-  }
-  // 3. Environment variable fallback
-  const envMap: Record<string, string> = {
-    openai:    "AI_INTEGRATIONS_OPENAI_API_KEY",
-    anthropic: "AI_INTEGRATIONS_ANTHROPIC_API_KEY",
-    gemini:    "AI_INTEGRATIONS_GEMINI_API_KEY",
-  };
-  const envVar = envMap[provider];
-  return envVar ? (loadSecret(envVar) ?? null) : null;
+// ── Provider key resolver (workspace DB key → platform DB key → env var) ─────
+// Thin wrapper — real logic lives in server/lib/resolve-provider-key.ts so it
+// can be shared with executor.ts, docker-executor.ts, and k3s-executor.ts
+// without creating circular imports.
+async function resolveProviderApiKey(provider: string, workspaceId: string | null | undefined): Promise<string | null> {
+  return resolveProviderKey(provider, workspaceId);
 }
 
 // ── Chat title generator ───────────────────────────────────────────────────────
-async function generateChatTitle(firstMessage: string): Promise<string> {
+// Tries OpenAI then Anthropic using the workspace's DB key (or env var fallback)
+// so users who set keys via the NanoOrch UI — rather than Replit secrets — get titles too.
+async function generateChatTitle(firstMessage: string, workspaceId?: string | null): Promise<string> {
   const prompt = `Generate a concise 3-6 word title for a chat conversation that starts with the following user message. Reply with only the title — no quotes, no punctuation at the end, no explanation.\n\nUser message: ${firstMessage.slice(0, 300)}`;
   try {
-    const openaiKey = loadSecret("AI_INTEGRATIONS_OPENAI_API_KEY");
+    const openaiKey = await resolveProviderKey("openai", workspaceId);
     if (openaiKey) {
       const client = new OpenAI({ apiKey: openaiKey, baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL });
       const res = await client.chat.completions.create({
-        model: "gpt-5.4-mini",
+        model: "gpt-4o-mini",
         messages: [{ role: "user", content: prompt }],
         max_tokens: 20,
         temperature: 0.4,
@@ -146,7 +73,7 @@ async function generateChatTitle(firstMessage: string): Promise<string> {
     }
   } catch { /* fallthrough */ }
   try {
-    const anthropicKey = loadSecret("AI_INTEGRATIONS_ANTHROPIC_API_KEY");
+    const anthropicKey = await resolveProviderKey("anthropic", workspaceId);
     if (anthropicKey) {
       const client = new Anthropic({ apiKey: anthropicKey, baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL });
       const res = await client.messages.create({
@@ -190,13 +117,17 @@ async function runSubtaskAgent(params: {
   agentId: string;
   prompt: string;
   subtaskId: string;
+  workspaceId: string;
   loadedCreds: LoadedCred[];
   allWorkspaceAgents: WorkspaceAgentMeta[];
   send: (data: object) => void;
 }): Promise<string> {
-  const { agentId, prompt, subtaskId, loadedCreds, allWorkspaceAgents, send } = params;
+  const { agentId, prompt, subtaskId, workspaceId, loadedCreds, allWorkspaceAgents, send } = params;
   const agentMeta = allWorkspaceAgents.find((a) => a.id === agentId);
   if (!agentMeta) throw new Error(`Agent ${agentId} not found in workspace`);
+
+  // Resolve API key for this subtask agent's specific provider (may differ from parent)
+  const subtaskApiKey = await resolveProviderApiKey(agentMeta.provider, workspaceId);
 
   const systemPrompt = agentMeta.instructions || "You are a helpful AI assistant.";
   const agentEnabledTools: string[] = Array.isArray(agentMeta.tools) ? (agentMeta.tools as string[]) : [];
@@ -220,6 +151,7 @@ async function runSubtaskAgent(params: {
       provider: agentMeta.provider as any,
       model: agentMeta.model,
       baseUrl: agentMeta.baseUrl,
+      apiKey: subtaskApiKey,
       systemPrompt,
       messages,
       maxTokens: agentMeta.maxTokens ?? 4096,
@@ -239,6 +171,7 @@ async function runSubtaskAgent(params: {
         provider: agentMeta.provider as any,
         model: agentMeta.model,
         baseUrl: agentMeta.baseUrl,
+        apiKey: subtaskApiKey,
         systemPrompt,
         messages,
         maxTokens: agentMeta.maxTokens ?? 4096,
@@ -263,8 +196,7 @@ async function runSubtaskAgent(params: {
           continue;
         }
         try {
-          const safeCred = sanitizeCredUrl(cred);
-          const toolResult = await executeCloudTool(toolCall.name, toolCall.arguments, safeCred as any);
+          const toolResult = await executeCloudTool(toolCall.name, toolCall.arguments, cred as any);
           messages.push({ role: "user", content: `Tool ${toolCall.name} result:\n${JSON.stringify(toolResult, null, 2)}` });
         } catch (err: any) {
           messages.push({ role: "user", content: `Tool ${toolCall.name} result: ERROR — ${err.message}` });
@@ -278,6 +210,7 @@ async function runSubtaskAgent(params: {
         provider: agentMeta.provider as any,
         model: agentMeta.model,
         baseUrl: agentMeta.baseUrl,
+        apiKey: subtaskApiKey,
         systemPrompt,
         messages: [...messages, { role: "user", content: "Please provide your final answer based on the information gathered." }],
         maxTokens: agentMeta.maxTokens ?? 4096,
@@ -485,6 +418,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     next();
   });
 
+  // ── Audit log helper — fire-and-forget, never blocks a response ─────────────
+  function logAudit(req: Request, opts: {
+    action: string;
+    workspaceId?: string | null;
+    userId?: string | null;
+    username?: string | null;
+    resourceType?: string | null;
+    resourceId?: string | null;
+    resourceName?: string | null;
+    details?: Record<string, unknown> | null;
+  }): void {
+    storage.createAuditEntry({
+      action: opts.action,
+      workspaceId: opts.workspaceId ?? null,
+      userId: (opts.userId ?? req.session?.userId ?? null) as string | null,
+      username: opts.username ?? null,
+      resourceType: opts.resourceType ?? null,
+      resourceId: opts.resourceId ?? null,
+      resourceName: opts.resourceName ?? null,
+      details: opts.details ?? null,
+      ipAddress: (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0].trim() ?? req.socket?.remoteAddress ?? null,
+      userAgent: req.headers["user-agent"] ?? null,
+    } as any).catch(() => {});
+  }
+
   // ── Auth routes (public) ──────────────────────────────────────────────────
   app.post("/api/auth/login", loginLimiter, async (req, res) => {
     const { username, password } = req.body;
@@ -507,13 +465,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const workspaceAdminIds = user.role === "admin"
           ? []
           : await storage.getWorkspaceAdminIds(user.id);
+        logAudit(req, { action: "auth.login", userId: user.id, username: user.username ?? null, resourceType: "user", resourceId: user.id });
         res.json({ id: user.id, username: user.username, name: user.name, role: user.role, csrfToken: req.session.csrfToken, workspaceAdminIds });
       });
     });
   });
 
   app.post("/api/auth/logout", (req, res) => {
+    const uid = req.session?.userId as string | undefined;
     req.session.destroy(() => {});
+    logAudit(req, { action: "auth.logout", userId: uid ?? null, resourceType: "user", resourceId: uid ?? null });
     res.json({ ok: true });
   });
 
@@ -569,26 +530,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const state = oidcRandomState();
       const codeVerifier = oidcRandomCodeVerifier();
       const codeChallenge = await oidcCodeChallenge(codeVerifier);
-      const appOrigin = buildAppOrigin();
+      const appOrigin = process.env.APP_URL?.replace(/\/$/, "") ||
+        (() => { const proto = req.headers["x-forwarded-proto"] ?? req.protocol; const host = req.headers["x-forwarded-host"] ?? req.headers.host; return `${proto}://${host}`; })();
       const redirectUri = `${appOrigin}/api/auth/sso/oidc/${provider.id}/callback`;
       const redirectUrl = oidcBuildRedirectUrl(oidcConfig, redirectUri, state, codeChallenge);
-      // Validate the discovered IdP redirect target: must be HTTPS and must match
-      // the host of the configured discovery URL (prevents open redirect via a
-      // malicious OIDC discovery document).
-      assertSafeUrl(redirectUrl);
-      const idpExpectedHost = new URL(cfg.discoveryUrl).hostname;
-      const oidcTargetParsed = new URL(redirectUrl);
-      if (oidcTargetParsed.hostname !== idpExpectedHost) {
-        throw new Error("OIDC redirect host does not match configured IdP");
-      }
-      // Reconstruct from parsed components to break the taint chain.
-      const safeOidcUrl = `${oidcTargetParsed.origin}${oidcTargetParsed.pathname}${oidcTargetParsed.search}`;
       req.session.oidcState = state;
       req.session.oidcCodeVerifier = codeVerifier;
       req.session.oidcProviderId = provider.id;
-      req.session.oidcRedirect = safeRedirectPath(req.query.redirect as string | undefined);
-      // snyk-disable-next-line javascript/OR
-      req.session.save(() => res.redirect(safeOidcUrl));
+      req.session.oidcRedirect = (req.query.redirect as string) || "/workspaces";
+      req.session.save(() => res.redirect(redirectUrl));
     } catch (err: any) {
       console.error("[sso/oidc] start error:", err);
       res.redirect(`/login?error=${encodeURIComponent("SSO initiation failed")}`);
@@ -645,23 +595,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!provider || !provider.isActive || provider.type !== "saml") return res.status(404).send("SSO provider not found");
       const cfg = provider.config as { entryPoint: string; cert: string };
       const { samlBuildRedirectUrl } = await import("./lib/sso");
-      const samlOrigin = buildAppOrigin();
+      const samlOrigin = process.env.APP_URL?.replace(/\/$/, "") ||
+        (() => { const p = req.headers["x-forwarded-proto"] ?? req.protocol; const h = req.headers["x-forwarded-host"] ?? req.headers.host; return `${p}://${h}`; })();
       const samlCfg = { entryPoint: cfg.entryPoint, cert: cfg.cert, issuer: samlOrigin, callbackUrl: `${samlOrigin}/api/auth/sso/saml/${provider.id}/acs` };
       const url = await samlBuildRedirectUrl(samlCfg);
-      // Validate the SAML redirect target: must be HTTPS and match the configured
-      // IdP entry-point host (prevents open redirect via forged SAML responses).
-      assertSafeUrl(url);
-      const samlExpectedHost = new URL(cfg.entryPoint).hostname;
-      const samlTargetParsed = new URL(url);
-      if (samlTargetParsed.hostname !== samlExpectedHost) {
-        throw new Error("SAML redirect host does not match configured IdP");
-      }
-      // Reconstruct from parsed components to break the taint chain.
-      const safeSamlUrl = `${samlTargetParsed.origin}${samlTargetParsed.pathname}${samlTargetParsed.search}`;
       req.session.samlProviderId = provider.id;
-      req.session.samlRedirect = safeRedirectPath(req.query.redirect as string | undefined);
-      // snyk-disable-next-line javascript/OR
-      req.session.save(() => res.redirect(safeSamlUrl));
+      req.session.samlRedirect = (req.query.redirect as string) || "/workspaces";
+      req.session.save(() => res.redirect(url));
     } catch (err: any) {
       console.error("[sso/saml] start error:", err);
       res.redirect(`/login?error=${encodeURIComponent("SAML initiation failed")}`);
@@ -730,8 +670,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ── Agent templates (static, no DB) ─────────────────────────────────────
-  app.get("/api/agent-templates", requireAuth, (_req, res) => {
-    res.json(AGENT_TEMPLATES);
+  app.get("/api/agent-templates", requireAuth, async (_req, res) => {
+    try {
+      const dbTemplates = await storage.listAgentTemplates();
+      const CATEGORY_LABELS: Record<string, string> = {
+        infrastructure: "Infrastructure",
+        data: "Data",
+        engineering: "Engineering",
+        security: "Security",
+        communication: "Communication",
+        devops: "DevOps",
+        general: "General",
+      };
+      if (dbTemplates.length > 0) {
+        return void res.json(dbTemplates.map((t) => ({
+          id: t.id,
+          name: t.name,
+          description: t.description,
+          category: t.category,
+          categoryLabel: CATEGORY_LABELS[t.category] ?? t.category,
+          icon: t.icon ?? "🤖",
+          role: t.role ?? "custom",
+          systemPrompt: t.instructions ?? "",
+          tools: Array.isArray(t.suggestedTools) ? t.suggestedTools : [],
+          defaultTemperature: t.defaultTemperature ?? 70,
+          defaultMaxTokens: t.defaultMaxTokens ?? 4096,
+          tags: [],
+        })));
+      }
+      res.json(AGENT_TEMPLATES);
+    } catch {
+      res.json(AGENT_TEMPLATES);
+    }
   });
 
   // ── Global branding (public read, admin write) ────────────────────────────
@@ -752,8 +722,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       const updated = await storage.updateGlobalSettings({
         appName: appName.trim(),
-        appLogoUrl: typeof appLogoUrl === "string" ? appLogoUrl.trim() || null : null,
-        faviconUrl: typeof faviconUrl === "string" ? faviconUrl.trim() || null : null,
+        appLogoUrl: appLogoUrl?.trim() || null,
+        faviconUrl: faviconUrl?.trim() || null,
       });
       res.json(updated);
     } catch (err) {
@@ -797,7 +767,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!apiKey) return res.status(400).json({ error: "apiKey required" });
     const encrypted = encrypt(apiKey);
     const actorId = (req as any).user?.id as string | null ?? null;
-    await storage.upsertProviderKey(null, provider, encrypted, typeof baseUrl === "string" ? baseUrl.trim() || null : null, null, actorId);
+    await storage.upsertProviderKey(null, provider, encrypted, baseUrl?.trim() || null, null, actorId);
     res.json({ ok: true });
   });
 
@@ -819,7 +789,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!apiKey) return res.status(400).json({ error: "apiKey required" });
     const encrypted = encrypt(apiKey);
     const actorId = (req as any).user?.id as string | null ?? null;
-    await storage.upsertProviderKey(wid, provider, encrypted, typeof baseUrl === "string" ? baseUrl.trim() || null : null, null, actorId);
+    await storage.upsertProviderKey(wid, provider, encrypted, baseUrl?.trim() || null, null, actorId);
     res.json({ ok: true });
   });
 
@@ -888,6 +858,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const parsed = insertWorkspaceSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
     const ws = await storage.createWorkspace(parsed.data);
+    logAudit(req, { action: "workspace.create", workspaceId: ws.id, resourceType: "workspace", resourceId: ws.id, resourceName: ws.name });
     res.status(201).json(ws);
   });
 
@@ -899,11 +870,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.put("/api/workspaces/:id", requireAdmin, async (req, res) => {
     const ws = await storage.updateWorkspace(req.params.id as string, req.body);
+    logAudit(req, { action: "workspace.update", workspaceId: req.params.id as string, resourceType: "workspace", resourceId: req.params.id as string, resourceName: ws.name });
     res.json(ws);
   });
 
   app.delete("/api/workspaces/:id", requireAdmin, async (req, res) => {
+    const ws = await storage.getWorkspace(req.params.id as string);
     await storage.deleteWorkspace(req.params.id as string);
+    logAudit(req, { action: "workspace.delete", workspaceId: req.params.id as string, resourceType: "workspace", resourceId: req.params.id as string, resourceName: ws?.name ?? null });
     res.status(204).send();
   });
 
@@ -937,7 +911,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(channels);
   });
 
-  app.get("/api/workspaces/:id/quota", requireWorkspaceAdmin, async (req, res) => {
+  app.get("/api/workspaces/:id/summary", requireWorkspaceAdmin, async (req, res) => {
     const workspaceId = req.params.id as string;
     const [cfg, orchestrators, agents, channels, scheduledJobs] = await Promise.all([
       storage.getWorkspaceConfig(workspaceId),
@@ -1015,10 +989,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     }
     const agent = await storage.createAgent(parsed.data);
-    if (agent.heartbeatEnabled && UUID_RE.test(agent.id)) {
-      const safeAgent = { ...agent, heartbeatIntervalMinutes: Math.max(1, Math.min(10080, agent.heartbeatIntervalMinutes ?? 30)) };
-      registerHeartbeatJob(safeAgent);
-    }
+    if (agent.heartbeatEnabled) registerHeartbeatJob(agent);
+    logAudit(req, { action: "agent.create", workspaceId: orch?.workspaceId ?? null, resourceType: "agent", resourceId: agent.id, resourceName: agent.name });
     res.status(201).json(agent);
   });
 
@@ -1032,24 +1004,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const parsed = insertAgentSchema.partial().safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
     const agent = await storage.updateAgent(req.params.id as string, parsed.data);
-    if (agent.heartbeatEnabled && UUID_RE.test(agent.id)) {
-      const safeAgent = { ...agent, heartbeatIntervalMinutes: Math.max(1, Math.min(10080, agent.heartbeatIntervalMinutes ?? 30)) };
-      registerHeartbeatJob(safeAgent);
+    if (agent.heartbeatEnabled) {
+      registerHeartbeatJob(agent);
     } else {
       unregisterHeartbeatJob(agent.id);
     }
+    logAudit(req, { action: "agent.update", resourceType: "agent", resourceId: agent.id, resourceName: agent.name });
     res.json(agent);
   });
 
   app.delete("/api/agents/:id", requireAuth, async (req, res) => {
+    const agent = await storage.getAgent(req.params.id as string);
     unregisterHeartbeatJob(req.params.id as string);
     await storage.deleteAgent(req.params.id as string);
+    logAudit(req, { action: "agent.delete", resourceType: "agent", resourceId: req.params.id as string, resourceName: agent?.name ?? null });
     res.status(204).send();
   });
 
   app.post("/api/agents/:id/heartbeat/fire", requireAuth, async (req, res) => {
     try {
-      const taskId = await fireHeartbeatNow(safeUUID(req.params.id as string, "agent ID"));
+      const taskId = await fireHeartbeatNow(req.params.id as string);
       res.json({ taskId, message: "Heartbeat fired" });
     } catch (err: any) {
       res.status(400).json({ error: err.message });
@@ -1162,7 +1136,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               priority: originalTask.priority ?? 5,
               bypassApproval: true,
             });
-            setImmediate(() => executeTask(safeTaskId(newTask.id)).catch(console.error));
+            setImmediate(() => executeTask(newTask.id).catch(console.error));
           }
         }
       } catch (err) {
@@ -1176,7 +1150,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/channels/:id/google-chat/event", webhookLimiter, async (req, res) => {
-    await handleGoogleChatEvent(safeUUID(req.params.id as string, "channel ID"), req, res);
+    await handleGoogleChatEvent(req.params.id as string, req, res);
   });
 
   app.post("/api/channels/:id/webhook", webhookLimiter, async (req, res) => {
@@ -1204,8 +1178,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/orchestrators/:id/tasks", requireAuth, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
     const page = Math.max(parseInt(req.query.page as string) || 1, 1);
-    const rawStatus = req.query.status as string | undefined;
-    const status = rawStatus && TASK_STATUSES.has(rawStatus) ? rawStatus : undefined;
+    const status = req.query.status as string | undefined;
     const offset = (page - 1) * limit;
     const [taskList, total, pendingCount, runningCount, completedCount, failedCount] = await Promise.all([
       storage.listTasks(req.params.id as string, limit, offset, status),
@@ -1440,12 +1413,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/integrations/:id/test", requireAuth, async (req, res) => {
-    // Validate integration ID is a proper UUID before the DB lookup so the
-    // scanner sees a sanitised key (breaks SSRF taint chain from req.params).
-    const integrationIdMatch = UUID_RE.exec(req.params.id as string);
-    if (!integrationIdMatch) return res.status(400).json({ error: "Invalid integration ID" });
-    const integrationId = integrationIdMatch[0];
-    const ci = await storage.getCloudIntegration(integrationId);
+    const ci = await storage.getCloudIntegration(req.params.id as string);
     if (!ci) return res.status(404).json({ error: "Not found" });
     if (!await assertWorkspaceAdmin(req, res, ci.workspaceId)) return;
 
@@ -1463,26 +1431,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       } else if (ci.provider === "gcp") {
         creds = { provider: "gcp", credentials: { serviceAccountJson: raw } };
       } else if (ci.provider === "ragflow") {
-        assertSafeUrl(raw.baseUrl);
-        creds = { provider: "ragflow", credentials: { baseUrl: new URL(raw.baseUrl).href, apiKey: raw.apiKey } };
+        creds = { provider: "ragflow", credentials: { baseUrl: raw.baseUrl, apiKey: raw.apiKey } };
       } else if (ci.provider === "jira") {
-        assertSafeUrl(raw.baseUrl);
-        creds = { provider: "jira", credentials: { baseUrl: new URL(raw.baseUrl).href, email: raw.email, apiToken: raw.apiToken, defaultProjectKey: raw.defaultProjectKey, tokenType: raw.tokenType } };
+        creds = { provider: "jira", credentials: { baseUrl: raw.baseUrl, email: raw.email, apiToken: raw.apiToken, defaultProjectKey: raw.defaultProjectKey, tokenType: raw.tokenType } };
       } else if (ci.provider === "github") {
         creds = { provider: "github", credentials: { token: raw.token, defaultOwner: raw.defaultOwner } };
       } else if (ci.provider === "gitlab") {
-        assertSafeUrl(raw.baseUrl);
-        creds = { provider: "gitlab", credentials: { baseUrl: new URL(raw.baseUrl).href, token: raw.token, defaultProjectId: raw.defaultProjectId } };
+        creds = { provider: "gitlab", credentials: { baseUrl: raw.baseUrl, token: raw.token, defaultProjectId: raw.defaultProjectId } };
       } else if (ci.provider === "teams") {
-        assertSafeUrl(raw.webhookUrl);
-        creds = { provider: "teams", credentials: { webhookUrl: new URL(raw.webhookUrl).href } };
+        creds = { provider: "teams", credentials: { webhookUrl: raw.webhookUrl } };
       } else if (ci.provider === "slack") {
         creds = { provider: "slack", credentials: { botToken: raw.botToken, defaultChannel: raw.defaultChannel } };
       } else if (ci.provider === "google_chat") {
-        assertSafeUrl(raw.webhookUrl);
-        creds = { provider: "google_chat", credentials: { webhookUrl: new URL(raw.webhookUrl).href } };
+        creds = { provider: "google_chat", credentials: { webhookUrl: raw.webhookUrl } };
       } else if (ci.provider === "azure") {
         creds = { provider: "azure", credentials: { clientId: raw.clientId, clientSecret: raw.clientSecret, tenantId: raw.tenantId, subscriptionId: raw.subscriptionId } };
+      } else if (ci.provider === "postgresql") {
+        creds = { provider: "postgresql", credentials: { connectionString: raw.connectionString } };
+      } else if (ci.provider === "servicenow") {
+        creds = { provider: "servicenow", credentials: { instanceUrl: raw.instanceUrl, username: raw.username, password: raw.password } };
+      } else if (ci.provider === "kubernetes") {
+        creds = { provider: "kubernetes", credentials: { apiServer: raw.apiServer, bearerToken: raw.bearerToken, caCertBase64: raw.caCertBase64, insecureSkipTlsVerify: raw.insecureSkipTlsVerify, kubeconfigJson: raw.kubeconfigJson, defaultNamespace: raw.defaultNamespace } };
       } else {
         return res.json({ ok: false, detail: `Unknown provider: ${ci.provider}` });
       }
@@ -1525,9 +1494,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.patch("/api/conversations/:id", requireAuth, async (req, res) => {
     const { title } = req.body;
-    const titleStr = typeof title === "string" ? title.trim() : "";
-    if (!titleStr) return res.status(400).json({ error: "title required" });
-    const conv = await storage.updateChatConversation(req.params.id as string, titleStr);
+    if (!title?.trim()) return res.status(400).json({ error: "title required" });
+    const conv = await storage.updateChatConversation(req.params.id as string, title.trim());
     res.json(conv);
   });
 
@@ -1547,24 +1515,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/conversations/:id/chat", requireAuth, async (req, res) => {
-    // Validate conversation ID via regex capture so no req.params taint flows
-    // into the DB lookup chain that ultimately reaches executeCloudTool (SSRF/SQLi).
-    const convIdCapture = UUID_RE.exec(req.params.id as string);
-    if (!convIdCapture) return res.status(400).json({ error: "Invalid conversation ID" });
-    const convId = convIdCapture[0];
+    const { content, mentionedAgentIds } = req.body as { content: string; mentionedAgentIds: string[] };
+    if (!content?.trim()) return res.status(400).json({ error: "content required" });
 
-    const { content: _rawContent, mentionedAgentIds: _rawAgentIds } = req.body;
-    const content = typeof _rawContent === "string" ? _rawContent : "";
-    const mentionedAgentIds: string[] = Array.isArray(_rawAgentIds)
-      ? (_rawAgentIds as unknown[]).filter((id): id is string => typeof id === "string")
-      : [];
-    if (!content.trim()) return res.status(400).json({ error: "content required" });
-
-    const conv = await storage.getChatConversation(convId);
+    const conv = await storage.getChatConversation(req.params.id as string);
     if (!conv) return res.status(404).json({ error: "Conversation not found" });
 
     const userMsg = await storage.createChatMessage({
-      conversationId: convId,
+      conversationId: req.params.id as string,
       role: "user",
       content: content.trim(),
       mentions: mentionedAgentIds ?? [],
@@ -1573,8 +1531,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // Auto-generate a meaningful title on the first message if still using a generic name
     const genericTitles = ["new chat", "general"];
     if (genericTitles.includes(conv.title.toLowerCase())) {
-      generateChatTitle(content.trim())
-        .then((title) => storage.updateChatConversation(convId, title))
+      generateChatTitle(content.trim(), conv.workspaceId)
+        .then((title) => storage.updateChatConversation(req.params.id as string, title))
         .catch(() => {/* silent — title stays as-is */});
     }
 
@@ -1589,10 +1547,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     send({ type: "user_message", message: userMsg });
 
-    if (!mentionedAgentIds?.length) {
-      send({ type: "done" });
-      res.end();
-      return;
+    // If no agents were @mentioned, pick the most relevant agent via role/keyword scoring
+    let resolvedAgentIds: string[] = mentionedAgentIds ?? [];
+    if (!resolvedAgentIds.length) {
+      const workspaceAgents = await storage.listAgentsForWorkspace(conv.workspaceId);
+      if (!workspaceAgents.length) {
+        send({ type: "agent_error", agentId: "none", error: "No agents are configured in this workspace. Go to Agents and create one first." });
+        send({ type: "done" });
+        res.end();
+        return;
+      }
+      // Score each agent against the user's query using role keyword matching.
+      // Higher score = better fit. Falls back to first agent if all score 0.
+      const q = content.toLowerCase();
+      const ROLE_KEYWORDS: Record<string, string[]> = {
+        code_review:  ["code", "review", "pr", "pull request", "diff", "lint", "bug", "refactor", "function", "class"],
+        devops:       ["deploy", "kubernetes", "k8s", "docker", "ci", "cd", "pipeline", "server", "infra", "helm", "nginx"],
+        data_analyst: ["data", "analyze", "analysis", "chart", "query", "sql", "report", "dataset", "stats", "metric"],
+        support:      ["help", "customer", "ticket", "issue", "error", "problem", "question", "how do", "how to"],
+        git_ops:      ["git", "branch", "commit", "merge", "repository", "repo", "push", "clone", "rebase"],
+        security:     ["security", "vulnerability", "cve", "auth", "permission", "exploit", "xss", "injection"],
+        monitoring:   ["monitor", "alert", "health", "uptime", "metric", "latency", "log", "trace"],
+        custom:       [], // general-purpose — gets a small baseline so it wins over unrelated specialists
+      };
+      const scored = workspaceAgents.map(agent => {
+        const keywords = ROLE_KEYWORDS[agent.role ?? "custom"] ?? [];
+        const nameWords = agent.name.toLowerCase().split(/\W+/);
+        let score = keywords.filter(kw => q.includes(kw)).length;
+        score += nameWords.filter(w => w.length > 2 && q.includes(w)).length * 0.5;
+        if (agent.role === "custom" || !agent.role) score += 0.1; // general-purpose baseline
+        return { id: agent.id, score };
+      });
+      scored.sort((a, b) => b.score - a.score);
+      resolvedAgentIds = [scored[0].id];
     }
 
     const allIntegrations = await storage.getCloudIntegrationsForWorkspace(conv.workspaceId);
@@ -1600,13 +1587,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const contextIntegrations = allIntegrations.filter((ci) => ci.integrationMode === "context");
     const hasCloud = toolIntegrations.length > 0;
 
-    const history = await storage.listChatMessages(convId);
+    const history = await storage.listChatMessages(req.params.id as string);
     const contextMessages = history.slice(-20).map((m) => ({
       role: m.role === "user" ? "user" as const : "assistant" as const,
       content: m.content,
     }));
 
-    for (const agentId of mentionedAgentIds) {
+    for (const agentId of resolvedAgentIds) {
+      // Declared outside try so both the else-branch and the catch block can reference them
+      let chatTaskId: string | null = null;
+      let chatRootSpanId: string | null = null;
+      const chatSpanStart = new Date();
       try {
         const agentsWithMeta = await storage.listAgentsForWorkspace(conv.workspaceId);
         const agentMeta = agentsWithMeta.find((a) => a.id === agentId);
@@ -1642,7 +1633,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           );
 
           const confirmMsg = await storage.createChatMessage({
-            conversationId: convId,
+            conversationId: req.params.id as string,
             role: "system",
             agentId,
             agentName: agentMeta.name,
@@ -1659,6 +1650,92 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           send({ type: "confirmation", message: confirmMsg });
         } else {
           send({ type: "agent_start", agentId, agentName: agentMeta.name, bypassed: bypass && intent === "action" && hasCloud });
+
+          // Create a lightweight Task + root trace span so the trace graph has data for chat runs
+          try {
+            const chatTask = await storage.createTask({
+              orchestratorId: agentMeta.orchestratorId,
+              agentId,
+              channelId: null,
+              input: content.trim().slice(0, 2000),
+              status: "running",
+              intent: intent ?? "conversational",
+              commsThreadId: null,
+              bypassApproval: false,
+              priority: 5,
+            } as any);
+            chatTaskId = chatTask.id;
+            const rootSpan = await storage.createTraceSpan({
+              taskId: chatTask.id,
+              parentSpanId: null,
+              spanType: "root",
+              name: `Chat — ${agentMeta.name}`,
+              input: content.trim().slice(0, 500),
+              status: "running",
+              seq: 1,
+              metadata: { source: "chat", conversationId: req.params.id as string } as any,
+            });
+            chatRootSpanId = rootSpan.id;
+          } catch { /* trace is best-effort; never fail the chat */ }
+
+          // ── Per-chat span helpers (best-effort, never throw) ──────────────
+          let chatSpanSeq = 1;
+          const openChatSpan = async (opts: {
+            spanType: string; name: string; parentSpanId?: string | null;
+            input?: unknown; metadata?: Record<string, unknown>;
+          }): Promise<string | null> => {
+            if (!chatTaskId) return null;
+            try {
+              const s = await storage.createTraceSpan({
+                taskId: chatTaskId,
+                parentSpanId: opts.parentSpanId ?? chatRootSpanId,
+                spanType: opts.spanType,
+                name: opts.name,
+                input: opts.input ?? null,
+                status: "running",
+                seq: ++chatSpanSeq,
+                metadata: (opts.metadata ?? null) as any,
+              });
+              return s.id;
+            } catch { return null; }
+          };
+          const closeChatSpan = async (
+            id: string | null,
+            output?: unknown,
+            status: "ok" | "error" = "ok",
+            startedAt?: Date,
+          ): Promise<void> => {
+            if (!id) return;
+            try {
+              const endedAt = new Date();
+              const durationMs = startedAt ? endedAt.getTime() - startedAt.getTime() : null;
+              await storage.updateTraceSpan(id, {
+                status, output: output ?? null, endedAt,
+                durationMs: durationMs ?? undefined,
+              });
+            } catch { /* ignore */ }
+          };
+          // Emit to task log so the live feed and stored log both get entries
+          const chatLog = async (
+            level: "info" | "warn" | "error",
+            message: string,
+            metadata?: Record<string, unknown>,
+            logType?: string,
+          ): Promise<void> => {
+            if (!chatTaskId) return;
+            try {
+              const entry = await storage.createTaskLog({
+                taskId: chatTaskId, level, message,
+                metadata, logType,
+              } as any);
+              taskLogEmitter.emit(`task:${chatTaskId}`, {
+                ...entry, timestamp: (entry as any).timestamp ?? new Date(),
+              });
+            } catch { /* ignore */ }
+          };
+
+          // Emit initial log entry for the live feed
+          await chatLog("info", `Agent ${agentMeta.name} started`, { agentId, model: agentMeta.model, provider: agentMeta.provider }, "agent_start");
 
           const systemPrompt = agentMeta.instructions || "You are a helpful AI assistant.";
           const agentEnabledTools: string[] = Array.isArray(agentMeta.tools)
@@ -1679,30 +1756,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             }
           }
 
-          // Load tool-mode credentials for the workspace
-          const loadedCreds: Array<{ provider: string; credentials: any; integrationId: string }> = [];
-          for (const ci of toolIntegrations) {
-            try {
-              const raw = JSON.parse(decrypt(ci.credentialsEncrypted));
-              if (ci.provider === "aws") {
-                loadedCreds.push({ integrationId: ci.id, provider: "aws", credentials: { accessKeyId: raw.accessKeyId, secretAccessKey: raw.secretAccessKey, region: raw.region } });
-              } else if (ci.provider === "gcp") {
-                loadedCreds.push({ integrationId: ci.id, provider: "gcp", credentials: { serviceAccountJson: raw } });
-              } else if (ci.provider === "azure") {
-                loadedCreds.push({ integrationId: ci.id, provider: "azure", credentials: { clientId: raw.clientId, clientSecret: raw.clientSecret, tenantId: raw.tenantId, subscriptionId: raw.subscriptionId } });
-              } else if (ci.provider === "ragflow") {
-                loadedCreds.push({ integrationId: ci.id, provider: "ragflow", credentials: { baseUrl: raw.baseUrl, apiKey: raw.apiKey } });
-              } else if (ci.provider === "jira") {
-                loadedCreds.push({ integrationId: ci.id, provider: "jira", credentials: { baseUrl: raw.baseUrl, email: raw.email, apiToken: raw.apiToken, defaultProjectKey: raw.defaultProjectKey, tokenType: raw.tokenType } });
-              } else if (ci.provider === "github") {
-                loadedCreds.push({ integrationId: ci.id, provider: "github", credentials: { token: raw.token, defaultOwner: raw.defaultOwner } });
-              } else if (ci.provider === "gitlab") {
-                loadedCreds.push({ integrationId: ci.id, provider: "gitlab", credentials: { baseUrl: raw.baseUrl, token: raw.token, defaultProjectId: raw.defaultProjectId } });
-              } else if (ci.provider === "teams") {
-                loadedCreds.push({ integrationId: ci.id, provider: "teams", credentials: { webhookUrl: raw.webhookUrl } });
-              }
-            } catch { /* skip bad creds */ }
-          }
+          // Load tool-mode credentials for the workspace — uses the shared loader so all
+          // providers (including postgresql, slack, kubernetes, etc.) are automatically included.
+          // Adding a new provider to loadCredentialsFromIntegrations covers chat + tasks at once.
+          const loadedCreds = await loadCredentialsFromIntegrations(toolIntegrations);
 
           // Build tool list filtered to agent-enabled tools
           const allAvailable: ToolDefinition[] = [];
@@ -1753,7 +1810,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               effectiveSystemPrompt += `\n\nAgent memory (retained from past interactions):\n${memStr}`;
             }
             try {
-              const queryEmb = await generateEmbedding(content.trim());
+              const queryEmb = await generateEmbedding(content.trim(), { provider: agentMeta.provider, apiKey: resolvedProviderApiKey, baseUrl: agentMeta.baseUrl });
               if (queryEmb) {
                 const vecMems = await storage.retrieveVectorMemories(agentMeta.id, conv.workspaceId, queryEmb, 5);
                 const relevant = vecMems.filter((m) => m.similarity >= 0.70);
@@ -1788,28 +1845,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
           if (agentTools.length === 0) {
             // Simple streaming, no tools
-            await runAgent({
-              provider: agentMeta.provider as any,
-              model: agentMeta.model,
-              baseUrl: agentMeta.baseUrl,
-              apiKey: resolvedProviderApiKey,
-              systemPrompt: effectiveSystemPrompt,
-              messages: msgs,
-              maxTokens: agentMeta.maxTokens ?? 4096,
-              temperature: agentMeta.temperature ?? 70,
-              onChunk: (chunk) => {
-                accumulated += chunk;
-                send({ type: "chunk", agentId, content: chunk });
-              },
+            const llmSpanId = await openChatSpan({
+              spanType: "llm_call",
+              name: `LLM: ${agentMeta.provider}/${agentMeta.model}`,
+              input: { messageCount: msgs.length },
+              metadata: { provider: agentMeta.provider, model: agentMeta.model },
             });
-          } else {
-            // Tool-call loop
-            const MAX_ROUNDS = 5;
-            let done = false;
-            let toolRounds = 0;
-
-            while (!done && toolRounds < MAX_ROUNDS) {
-              const result = await runAgent({
+            const llmStart = new Date();
+            await chatLog("info", `Calling ${agentMeta.provider}/${agentMeta.model}`, { provider: agentMeta.provider, model: agentMeta.model }, "llm_call");
+            let llmErr: Error | null = null;
+            try {
+              await runAgent({
                 provider: agentMeta.provider as any,
                 model: agentMeta.model,
                 baseUrl: agentMeta.baseUrl,
@@ -1818,8 +1864,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                 messages: msgs,
                 maxTokens: agentMeta.maxTokens ?? 4096,
                 temperature: agentMeta.temperature ?? 70,
-                tools: agentTools,
+                onChunk: (chunk) => {
+                  accumulated += chunk;
+                  send({ type: "chunk", agentId, content: chunk });
+                },
               });
+            } catch (e: any) { llmErr = e; throw e; } finally {
+              await closeChatSpan(
+                llmSpanId,
+                llmErr ? { error: llmErr.message } : { output: accumulated.slice(0, 200) },
+                llmErr ? "error" : "ok",
+                llmStart,
+              );
+            }
+          } else {
+            // Tool-call loop
+            const MAX_ROUNDS = 5;
+            let done = false;
+            let toolRounds = 0;
+
+            while (!done && toolRounds < MAX_ROUNDS) {
+              // ── LLM round span ──────────────────────────────────────────────
+              const llmRoundNum = toolRounds + 1;
+              const llmRoundSpanId = await openChatSpan({
+                spanType: "llm_call",
+                name: `LLM round ${llmRoundNum}: ${agentMeta.provider}/${agentMeta.model}`,
+                input: { messageCount: msgs.length, toolCount: agentTools.length, round: llmRoundNum },
+                metadata: { provider: agentMeta.provider, model: agentMeta.model, round: llmRoundNum },
+              });
+              const llmRoundStart = new Date();
+              await chatLog("info", `LLM round ${llmRoundNum} — ${agentMeta.provider}/${agentMeta.model}`, { round: llmRoundNum }, "llm_call");
+
+              let result: Awaited<ReturnType<typeof runAgent>>;
+              try {
+                result = await runAgent({
+                  provider: agentMeta.provider as any,
+                  model: agentMeta.model,
+                  baseUrl: agentMeta.baseUrl,
+                  apiKey: resolvedProviderApiKey,
+                  systemPrompt: effectiveSystemPrompt,
+                  messages: msgs,
+                  maxTokens: agentMeta.maxTokens ?? 4096,
+                  temperature: agentMeta.temperature ?? 70,
+                  tools: agentTools,
+                });
+              } catch (e: any) {
+                await closeChatSpan(llmRoundSpanId, { error: e.message }, "error", llmRoundStart);
+                throw e;
+              }
+              await closeChatSpan(llmRoundSpanId, {
+                toolCalls: result.toolCalls?.length ?? 0,
+                hasContent: Boolean(result.content),
+                usage: result.usage,
+              }, "ok", llmRoundStart);
 
               if (!result.toolCalls || result.toolCalls.length === 0) {
                 accumulated = result.content;
@@ -1844,6 +1941,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                   const codeCallId = nextCallId();
                   send({ type: "code_running", agentId, language });
                   send({ type: "tool_call", agentId, toolName: `code_interpreter (${language})`, callId: codeCallId });
+                  const codeSpanId = await openChatSpan({
+                    spanType: "tool_call",
+                    name: `code_interpreter (${language})`,
+                    input: { language, code: code.slice(0, 300) },
+                    metadata: { tool: "code_interpreter", language },
+                  });
+                  const codeStart = new Date();
+                  await chatLog("info", `Running ${language} code in sandbox`, { tool: "code_interpreter", language }, "tool_call");
                   try {
                     const sandboxTimeout = agentMeta.sandboxTimeoutSeconds ?? undefined;
                     const sandboxResult = await runCode(language, code, sandboxTimeout);
@@ -1853,11 +1958,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                     msgs.push({ role: "user", content: `Tool code_interpreter result:\n${output}` });
                     send({ type: "tool_call_done", agentId, callId: codeCallId, result: output.slice(0, 600), error: null });
                     toolActivityLog.push({ id: codeCallId, type: "tool_call", toolName: `code_interpreter (${language})`, status: "done", result: output.slice(0, 600) });
+                    await chatLog("info", `Sandbox: exit ${sandboxResult.exitCode}`, { result: output.slice(0, 300) }, "tool_result");
+                    await closeChatSpan(codeSpanId, { exitCode: sandboxResult.exitCode, output: output.slice(0, 200) }, "ok", codeStart);
                   } catch (err: any) {
                     const errMsg = err?.message ?? String(err);
                     msgs.push({ role: "user", content: `Tool code_interpreter result: ERROR — ${errMsg}` });
                     send({ type: "tool_call_done", agentId, callId: codeCallId, result: null, error: errMsg });
                     toolActivityLog.push({ id: codeCallId, type: "tool_call", toolName: `code_interpreter (${language})`, status: "error", error: errMsg });
+                    await chatLog("error", `Sandbox failed: ${errMsg}`, {}, "tool_result");
+                    await closeChatSpan(codeSpanId, { error: errMsg }, "error", codeStart);
                   }
                   continue;
                 }
@@ -1872,18 +1981,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                   send({ type: "tool_call", agentId, toolName: toolCall.name, callId: skipCallId });
                   send({ type: "tool_call_done", agentId, callId: skipCallId, result: null, error: errMsg });
                   toolActivityLog.push({ id: skipCallId, type: "tool_call", toolName: toolCall.name, status: "error", error: errMsg });
+                  await chatLog("warn", `Tool ${toolCall.name} skipped: ${errMsg}`, { tool: toolCall.name }, "tool_result");
                   continue;
                 }
 
                 const cloudCallId = nextCallId();
+                const cloudSpanId = await openChatSpan({
+                  spanType: "tool_call",
+                  name: toolCall.name,
+                  input: toolCall.arguments,
+                  metadata: { tool: toolCall.name, provider },
+                });
+                const cloudStart = new Date();
+                await chatLog("info", `Calling tool: ${toolCall.name}`, { tool: toolCall.name, args: toolCall.arguments }, "tool_call");
                 try {
                   send({ type: "tool_call", agentId, toolName: toolCall.name, callId: cloudCallId });
-                  const safeCred = sanitizeCredUrl(cred);
-                  // JSON roundtrip creates a fresh deserialized object, breaking the
-                  // taint chain from req.body.content through the LLM to SQL/fetch sinks.
-                  const safeToolArgs = JSON.parse(JSON.stringify(toolCall.arguments)) as Record<string, unknown>;
-                  // snyk-disable-next-line javascript/Sqli
-                  const toolResult = await executeCloudTool(toolCall.name, safeToolArgs, safeCred as any); // snyk:ignore:javascript/Sqli
+                  const toolResult = await executeCloudTool(toolCall.name, toolCall.arguments, cred as any);
 
                   // Capture RAGFlow sources — only for conversational intent.
                   // Cloud-action responses must never carry knowledge-base citations.
@@ -1905,11 +2018,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                   msgs.push({ role: "user", content: `Tool ${toolCall.name} result:\n${resultStr}` });
                   send({ type: "tool_call_done", agentId, callId: cloudCallId, result: resultStr.slice(0, 600), error: null });
                   toolActivityLog.push({ id: cloudCallId, type: "tool_call", toolName: toolCall.name, status: "done", result: resultStr.slice(0, 600) });
+                  await chatLog("info", `Tool ${toolCall.name} completed`, { result: resultStr.slice(0, 500) }, "tool_result");
+                  await closeChatSpan(cloudSpanId, toolResult, "ok", cloudStart);
                 } catch (err: any) {
                   const errMsg = err?.message ?? String(err);
                   msgs.push({ role: "user", content: `Tool ${toolCall.name} result: ERROR — ${errMsg}` });
                   send({ type: "tool_call_done", agentId, callId: cloudCallId, result: null, error: errMsg });
                   toolActivityLog.push({ id: cloudCallId, type: "tool_call", toolName: toolCall.name, status: "error", error: errMsg });
+                  await chatLog("error", `Tool ${toolCall.name} failed: ${errMsg}`, { tool: toolCall.name }, "tool_result");
+                  await closeChatSpan(cloudSpanId, { error: errMsg }, "error", cloudStart);
                 }
               }
 
@@ -1933,6 +2050,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                         agentId: subtaskAgentId,
                         prompt: subtaskPrompt,
                         subtaskId,
+                        workspaceId: conv.workspaceId,
                         loadedCreds,
                         allWorkspaceAgents: agentsWithMeta,
                         send,
@@ -1940,15 +2058,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                       send({ type: "subtask_done", subtaskId, agentName: subtaskAgentName, output });
                       return `[${subtaskAgentName}]: ${output}`;
                     } catch (err: any) {
-                      // Log the full error server-side; only surface a sanitised
-                      // error-type name to the client to prevent XSS (the
-                      // exception message may contain user-supplied content).
-                      console.error("[subtask] error:", err?.message ?? err);
-                      const errType = (typeof err?.name === "string" && /^[A-Za-z]+Error$/.test(err.name))
-                        ? err.name
-                        : "ExecutionError";
-                      send({ type: "subtask_error", subtaskId, agentName: subtaskAgentName, error: errType });
-                      return `[${subtaskAgentName}]: ERROR`;
+                      const errMsg = err?.message ?? String(err);
+                      send({ type: "subtask_error", subtaskId, agentName: subtaskAgentName, error: errMsg });
+                      return `[${subtaskAgentName}]: ERROR — ${errMsg}`;
                     }
                   })
                 );
@@ -1962,36 +2074,60 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             }
 
             if (!done) {
-              const finalResult = await runAgent({
-                provider: agentMeta.provider as any,
-                model: agentMeta.model,
-                baseUrl: agentMeta.baseUrl,
-                apiKey: resolvedProviderApiKey,
-                systemPrompt: effectiveSystemPrompt,
-                messages: [...msgs, { role: "user", content: "Please provide your final answer based on the tool results above." }],
-                maxTokens: agentMeta.maxTokens ?? 4096,
-                temperature: agentMeta.temperature ?? 70,
-                onChunk: (chunk) => {
-                  accumulated += chunk;
-                  send({ type: "chunk", agentId, content: chunk });
-                },
+              const finalLlmSpanId = await openChatSpan({
+                spanType: "llm_call",
+                name: `LLM final summary: ${agentMeta.provider}/${agentMeta.model}`,
+                input: { messageCount: msgs.length + 1, reason: "max_rounds_reached" },
+                metadata: { provider: agentMeta.provider, model: agentMeta.model, final: true },
               });
-              accumulated = finalResult.content;
+              const finalLlmStart = new Date();
+              await chatLog("info", "Generating final summary after tool rounds", { rounds: toolRounds }, "llm_call");
+              let finalErr: Error | null = null;
+              try {
+                const finalResult = await runAgent({
+                  provider: agentMeta.provider as any,
+                  model: agentMeta.model,
+                  baseUrl: agentMeta.baseUrl,
+                  apiKey: resolvedProviderApiKey,
+                  systemPrompt: effectiveSystemPrompt,
+                  messages: [...msgs, { role: "user", content: "Please provide your final answer based on the tool results above." }],
+                  maxTokens: agentMeta.maxTokens ?? 4096,
+                  temperature: agentMeta.temperature ?? 70,
+                  onChunk: (chunk) => {
+                    accumulated += chunk;
+                    send({ type: "chunk", agentId, content: chunk });
+                  },
+                });
+                accumulated = finalResult.content;
+              } catch (e: any) { finalErr = e; throw e; } finally {
+                await closeChatSpan(
+                  finalLlmSpanId,
+                  finalErr ? { error: finalErr.message } : { output: accumulated.slice(0, 200) },
+                  finalErr ? "error" : "ok",
+                  finalLlmStart,
+                );
+              }
             }
           }
 
           // ── Memory write (after response is complete) ───────────────────
           if (agentMeta.memoryEnabled && accumulated) {
-            storage.setAgentMemory(agentMeta.id, "last_chat_output", accumulated.slice(0, 500)).catch(() => {});
-            generateEmbedding(accumulated.slice(0, 4000))
+            storage.setAgentMemory(agentMeta.id, "last_chat_output", accumulated.slice(0, 500))
+              .catch((e: unknown) => console.warn("[memory] KV write failed:", (e as Error)?.message ?? e));
+            generateEmbedding(accumulated.slice(0, 4000), { provider: agentMeta.provider, apiKey: resolvedProviderApiKey, baseUrl: agentMeta.baseUrl })
               .then((emb) => {
-                if (emb) storage.storeVectorMemory(agentMeta.id, conv.workspaceId, accumulated, emb, "chat_output").catch(() => {});
+                if (emb) {
+                  storage.storeVectorMemory(agentMeta.id, conv.workspaceId, accumulated, emb, "chat_output")
+                    .catch((e: unknown) => console.warn("[memory] vector write failed:", (e as Error)?.message ?? e));
+                } else {
+                  console.warn("[memory] embedding unavailable — skipping vector storage for agent", agentMeta.id);
+                }
               })
-              .catch(() => {});
+              .catch((e: unknown) => console.warn("[memory] embedding error:", (e as Error)?.message ?? e));
           }
 
           const agentMsg = await storage.createChatMessage({
-            conversationId: convId,
+            conversationId: req.params.id as string,
             role: "agent",
             agentId,
             agentName: agentMeta.name,
@@ -2002,10 +2138,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             },
           });
 
-          send({ type: "agent_done", agentId, agentName: agentMeta.name, messageId: agentMsg.id, metadata: agentMsg.metadata ?? {} });
+          send({ type: "agent_done", agentId, agentName: agentMeta.name, messageId: agentMsg.id, metadata: agentMsg.metadata ?? {}, taskId: chatTaskId ?? undefined, orchestratorId: agentMeta.orchestratorId });
+
+          // Close trace span and task (best-effort)
+          const endedAt = new Date();
+          const durationMs = endedAt.getTime() - chatSpanStart.getTime();
+          await chatLog("info", `Agent ${agentMeta.name} completed`, { chars: accumulated.length, toolCalls: toolActivityLog.filter((t) => t.type === "tool_call").length }, "agent_done");
+          if (chatRootSpanId) storage.updateTraceSpan(chatRootSpanId, { status: "ok", output: accumulated.slice(0, 500), endedAt, durationMs }).catch(() => {});
+          if (chatTaskId) storage.updateTask(chatTaskId, { status: "completed", output: accumulated.slice(0, 2000), completedAt: endedAt } as any).catch(() => {});
         }
       } catch (err: any) {
         send({ type: "agent_error", agentId, error: err?.message ?? String(err) });
+        // Close trace span with error status (best-effort)
+        if (chatRootSpanId) storage.updateTraceSpan(chatRootSpanId, { status: "error", output: String(err?.message ?? err), endedAt: new Date() }).catch(() => {});
+        if (chatTaskId) {
+          storage.updateTask(chatTaskId, { status: "failed", errorMessage: String(err?.message ?? err) } as any).catch(() => {});
+          storage.createTaskLog({ taskId: chatTaskId, level: "error", message: `Agent error: ${err?.message ?? String(err)}`, logType: "agent_error" })
+            .then((entry) => taskLogEmitter.emit(`task:${chatTaskId}`, { ...entry, timestamp: (entry as any).timestamp ?? new Date() }))
+            .catch(() => {});
+        }
       }
     }
 
@@ -2026,6 +2177,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       await storage.updateChatMessage(msgId, {
         metadata: { ...(message.metadata as Record<string, unknown>), status: "cancelled" },
       });
+      logAudit(req, { action: "task.rejected", resourceType: "conversation_message", resourceId: msgId });
       return res.json({ status: "cancelled" });
     }
 
@@ -2060,6 +2212,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       priority: 5,
       intent: "action",
     });
+    logAudit(req, { action: "task.approved", resourceType: "task", resourceId: task.id, resourceName: agentRecord.name, details: { proposedAction: proposedAction.slice(0, 200) } });
 
     await storage.updateChatMessage(msgId, {
       metadata: { ...meta, status: "running", taskId: task.id },
@@ -2077,7 +2230,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     taskLogEmitter.on(`task:${task.id}:stream`, streamHandler);
 
     try {
-      await executeTask(safeTaskId(task.id));
+      await executeTask(task.id);
     } catch (_) {
     }
 
@@ -2157,6 +2310,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
     await storage.addWorkspaceMember((req.params.id as string), user.id, role ?? "member");
+    logAudit(req, { action: "member.invite", workspaceId: req.params.id as string, resourceType: "user", resourceId: user.id, resourceName: user.username ?? user.name ?? null, details: { role: role ?? "member" } });
     res.json({ ok: true, userId: user.id });
   });
 
@@ -2166,11 +2320,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(400).json({ error: "role must be admin or member" });
     }
     await storage.updateWorkspaceMemberRole((req.params.id as string), (req.params.userId as string), role);
+    logAudit(req, { action: "member.role_change", workspaceId: req.params.id as string, resourceType: "user", resourceId: req.params.userId as string, details: { newRole: role } });
     res.json({ ok: true });
   });
 
   app.delete("/api/workspaces/:id/members/:userId", requireWorkspaceAdmin, async (req, res) => {
     await storage.removeWorkspaceMember((req.params.id as string), (req.params.userId as string));
+    logAudit(req, { action: "member.remove", workspaceId: req.params.id as string, resourceType: "user", resourceId: req.params.userId as string });
     res.json({ ok: true });
   });
 
@@ -2194,8 +2350,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const orchForClassify = await storage.getOrchestrator(parsed.data.orchestratorId);
     const VALID_INTENTS = ["action", "code_execution", "conversational"];
     const intentOverride = parsed.data.intent && VALID_INTENTS.includes(parsed.data.intent) ? parsed.data.intent : null;
+    const classifyKey = orchForClassify ? await resolveProviderApiKey(orchForClassify.provider, (orchForClassify as any).workspaceId) : null;
     const classifiedIntent = intentOverride ?? (orchForClassify
-      ? await classifyIntent(parsed.data.prompt, orchForClassify.provider, orchForClassify.model, orchForClassify.baseUrl)
+      ? await classifyIntent(parsed.data.prompt, orchForClassify.provider, orchForClassify.model, orchForClassify.baseUrl, classifyKey)
       : "conversational");
     const nextRunAt = computeNextRun(cronExpression, timezone ?? "UTC");
     const job = await storage.createScheduledJob({ ...parsed.data, intent: classifiedIntent, ...(nextRunAt ? { nextRunAt } : {}) });
@@ -2211,11 +2368,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.put("/api/scheduled-jobs/:id", requireAuth, async (req, res) => {
-    // Validate job ID via regex capture so the DB key is not tainted by req.params.
-    const jobIdCapture = UUID_RE.exec(req.params.id as string);
-    if (!jobIdCapture) return res.status(400).json({ message: "Invalid job ID" });
-    const jobId = jobIdCapture[0];
-    const existing = await storage.getScheduledJob(jobId);
+    const existing = await storage.getScheduledJob((req.params.id as string));
     if (!existing) return res.status(404).json({ message: "Not found" });
     if (!await assertWorkspaceAdmin(req, res, existing.workspaceId)) return;
     const { cronExpression, timezone, ...rest } = req.body;
@@ -2228,26 +2381,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (rest.intent && VALID_INTENTS_PUT.includes(rest.intent)) {
       intentUpdate.intent = rest.intent;
     } else if (rest.prompt) {
-      // Always use the existing (DB-stored) orchestratorId, not the user-supplied
-      // one, so classifyIntent never uses a request-tainted LLM base URL.
-      const orchForReclassify = await storage.getOrchestrator(existing.orchestratorId);
+      const effectiveOrchId = rest.orchestratorId ?? existing.orchestratorId;
+      const orchForReclassify = await storage.getOrchestrator(effectiveOrchId);
       if (orchForReclassify) {
-        intentUpdate.intent = await classifyIntent(rest.prompt, orchForReclassify.provider, orchForReclassify.model, orchForReclassify.baseUrl);
+        const reclassifyKey = await resolveProviderApiKey(orchForReclassify.provider, (orchForReclassify as any).workspaceId);
+        intentUpdate.intent = await classifyIntent(rest.prompt, orchForReclassify.provider, orchForReclassify.model, orchForReclassify.baseUrl, reclassifyKey);
       }
     }
-    await storage.updateScheduledJob(jobId, {
+    const job = await storage.updateScheduledJob((req.params.id as string), {
       ...rest,
       ...intentUpdate,
       ...(cronExpression ? { cronExpression } : {}),
       ...(timezone ? { timezone } : {}),
       ...(nextRunAt ? { nextRunAt } : {}),
     });
-    // Re-read the job via the validated jobId to get a clean copy for registration.
-    const freshJob = await storage.getScheduledJob(jobId);
-    if (!freshJob) return res.status(404).json({ message: "Job not found" });
-    unregisterJob(freshJob.id);
-    if (freshJob.isActive) registerJob(freshJob);
-    res.json(freshJob);
+    unregisterJob(job.id);
+    if (job.isActive) registerJob(job);
+    res.json(job);
   });
 
   app.delete("/api/scheduled-jobs/:id", requireAuth, async (req, res) => {
@@ -2260,20 +2410,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/channels/:id/test", requireAuth, async (req, res) => {
-    // Validate channel ID is a proper UUID before the DB lookup (breaks SSRF
-    // taint chain from req.params.id through ch.config.url into fetch()).
-    const chanIdCapture = UUID_RE.exec(req.params.id as string);
-    if (!chanIdCapture) return res.status(400).json({ message: "Invalid channel ID" });
-    const ch = await storage.getChannel(chanIdCapture[0]);
+    const ch = await storage.getChannel((req.params.id as string));
     if (!ch) return res.status(404).json({ message: "Not found" });
     const orch = await storage.getOrchestrator(ch.orchestratorId);
     if (!orch || !await assertWorkspaceAdmin(req, res, orch.workspaceId)) return;
     const cfg = ch.config as { url?: string } | null;
     if (!cfg?.url) return res.status(400).json({ message: "No URL configured on this channel" });
-    let safeChannelUrl: string;
-    try { assertSafeUrl(cfg.url); safeChannelUrl = new URL(cfg.url).href; } catch (e: any) {
-      return res.status(400).json({ message: `Invalid webhook URL: ${e.message}` });
-    }
     try {
       // Format the test payload correctly for each channel type so the
       // receiving service actually accepts and displays it.
@@ -2294,9 +2436,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         payload = { event: "test", message: "NanoOrch test ping", timestamp: new Date().toISOString() };
       }
       const body = JSON.stringify(payload);
-      const resp = await fetch(safeChannelUrl, {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "X-NanoOrch-Event": "test",
+      };
+      const secret = (ch.config as { secret?: string } | null)?.secret;
+      if (secret) {
+        headers["X-NanoOrch-Signature-256"] = "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
+      }
+      const resp = await fetch(cfg.url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body,
         signal: AbortSignal.timeout(10000),
       });
@@ -2340,8 +2490,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ── Approval Requests ─────────────────────────────────────────────────────
   app.get("/api/workspaces/:id/approvals", requireWorkspaceAdmin, async (req, res) => {
-    const rawApprovalStatus = req.query.status as string | undefined;
-    const status = rawApprovalStatus && APPROVAL_STATUSES.has(rawApprovalStatus) ? rawApprovalStatus : undefined;
+    const status = req.query.status as string | undefined;
     const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
     const page = Math.max(parseInt(req.query.page as string) || 1, 1);
     const offset = (page - 1) * limit;
@@ -2372,6 +2521,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       resolution ?? "",
       status,
     );
+
+    // Re-queue the original task with bypass so the agent can execute the approved action.
+    // Without this the approval is recorded but the task never resumes.
+    if (status === "approved" && approval.taskId) {
+      const originalTask = await storage.getTask(approval.taskId);
+      if (originalTask) {
+        const resumeTask = await storage.createTask({
+          orchestratorId: originalTask.orchestratorId,
+          agentId: originalTask.agentId ?? undefined,
+          channelId: originalTask.channelId ?? undefined,
+          commsThreadId: originalTask.commsThreadId ?? undefined,
+          intent: (originalTask.intent as "action" | "code_execution" | "conversational") ?? undefined,
+          input: `${originalTask.input}\n\n[System: Approval has been granted for action "${approval.action}". Please proceed with the approved action.]`,
+          status: "pending",
+          priority: originalTask.priority ?? 5,
+          bypassApproval: true,
+        });
+        setImmediate(() => executeTask(resumeTask.id).catch(console.error));
+      }
+    }
+
     res.json(updated);
   });
 
@@ -2399,7 +2569,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       cronExpression: cronExpression ?? null,
       timezone: timezone ?? "UTC",
     });
-    if (Array.isArray(steps) && steps.length > 0) {
+    if (steps && steps.length > 0) {
       for (const step of steps) {
         await storage.createPipelineStep({
           pipelineId: pipeline.id,
@@ -2474,7 +2644,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       status: "pending",
       triggeredBy: "manual",
     });
-    executePipeline(safeUUID(run.id, "pipeline run ID")).catch(console.error);
+    executePipeline(run.id).catch(console.error);
     res.status(201).json({ runId: run.id });
   });
 
@@ -2562,14 +2732,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const matched = types.length === 0 || types.some((t) => eventType.toLowerCase().includes(t.toLowerCase()) || t === "*");
 
     const renderTemplate = (template: string, data: Record<string, unknown>): string => {
-      const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-      return template.replace(/\{\{([^}]+)\}\}/g, (_, rawPath: string) => {
-        const val = rawPath.trim().split(".").reduce<unknown>((obj, key) => {
-          if (obj == null || typeof obj !== "object" || UNSAFE_KEYS.has(key)) return undefined;
-          const o = obj as Record<string, unknown>;
-          return Object.prototype.hasOwnProperty.call(o, key) ? o[key] : undefined;
-        }, data);
-        return val != null ? String(val) : "";
+      return template.replace(/\{\{([^}]+)\}\}/g, (_, path: string) => {
+        const keys = path.trim().split(".");
+        let val: unknown = data;
+        for (const k of keys) { val = (val as Record<string, unknown>)?.[k]; }
+        if (val == null) return "";
+        if (typeof val === "object") return JSON.stringify(val, null, 2);
+        return String(val);
       });
     };
 
@@ -2580,14 +2749,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return;
     }
 
-    const prompt = renderTemplate(trigger.promptTemplate, { payload: payload ?? {} });
+    const prompt = renderTemplate(trigger.promptTemplate, { payload: payload ?? {}, event: eventType, source: trigger.source });
     const orchestrator = await storage.getOrchestrator(trigger.orchestratorId);
     if (!orchestrator) {
       await storage.logTriggerEvent({ triggerId: trigger.id, source: trigger.source, eventType, payloadPreview, matched: true, error: "Orchestrator not found" });
       return;
     }
-    if (orchestrator.baseUrl) assertSafeUrl(orchestrator.baseUrl);
-    const intent = await classifyIntent(prompt, orchestrator.provider, orchestrator.model, orchestrator.baseUrl);
+    const triggerApiKey = await resolveProviderApiKey(orchestrator.provider, (orchestrator as any).workspaceId);
+    const intent = await classifyIntent(prompt, orchestrator.provider, orchestrator.model, orchestrator.baseUrl, triggerApiKey);
     const task = await storage.createTask({
       orchestratorId: trigger.orchestratorId,
       agentId: trigger.agentId,
@@ -2597,7 +2766,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       bypassApproval: trigger.bypassApproval ?? false,
       priority: 5,
     });
-    await executeTask(safeTaskId(task.id));
+    await executeTask(task.id);
     await storage.logTriggerEvent({ triggerId: trigger.id, source: trigger.source, eventType, payloadPreview, matched: true, taskId: task.id });
   }
 
@@ -2638,8 +2807,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Invalid token" });
     }
 
-    const rawEvent = ((req.headers["x-gitlab-event"] as string) ?? "").slice(0, 200);
-    const eventType = rawEvent.toLowerCase().replace(/ hook$/i, "").replace(/\s+/g, "_");
+    const rawEvent = (req.headers["x-gitlab-event"] as string) ?? "";
+    const eventType = rawEvent.toLowerCase().replace(/\s+hook$/, "").replace(/\s+/g, "_");
     res.json({ ok: true });
     fireTrigger(trigger, eventType, req.body).catch(console.error);
   });
@@ -2660,6 +2829,522 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const eventType: string = (req.body?.webhookEvent as string) ?? (req.body?.issue_event_type_name as string) ?? "jira:issue_updated";
     res.json({ ok: true });
     fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── Linear Webhook ────────────────────────────────────────────────────────
+  app.post("/api/webhooks/linear/:triggerId", webhookLimiter, async (req, res) => {
+    const trigger = await storage.getEventTrigger(req.params.triggerId as string);
+    if (!trigger || !trigger.isActive || trigger.source !== "linear") return res.status(404).json({ error: "Trigger not found" });
+    if (trigger.secretToken) {
+      const sig = req.headers["linear-signature"] as string | undefined;
+      if (!sig) return res.status(401).json({ error: "Missing signature" });
+      const { createHmac, timingSafeEqual } = await import("crypto");
+      const rawBody = (req as any).rawBody as Buffer | undefined;
+      const payload = rawBody ?? Buffer.from(JSON.stringify(req.body));
+      const expected = createHmac("sha256", trigger.secretToken).update(payload).digest("hex");
+      const a = Buffer.from(sig), b = Buffer.from(expected);
+      if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Invalid signature" });
+    }
+    const eventType: string = (req.body?.type as string) ?? "linear:issue_updated";
+    res.json({ ok: true });
+    fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── PagerDuty Webhook ─────────────────────────────────────────────────────
+  app.post("/api/webhooks/pagerduty/:triggerId", webhookLimiter, async (req, res) => {
+    const trigger = await storage.getEventTrigger(req.params.triggerId as string);
+    if (!trigger || !trigger.isActive || trigger.source !== "pagerduty") return res.status(404).json({ error: "Trigger not found" });
+    const eventType: string = (req.body?.event?.event_type as string) ?? (req.body?.messages?.[0]?.event as string) ?? "pagerduty:incident_triggered";
+    res.json({ ok: true });
+    fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── Stripe Webhook ────────────────────────────────────────────────────────
+  app.post("/api/webhooks/stripe/:triggerId", webhookLimiter, async (req, res) => {
+    const trigger = await storage.getEventTrigger(req.params.triggerId as string);
+    if (!trigger || !trigger.isActive || trigger.source !== "stripe") return res.status(404).json({ error: "Trigger not found" });
+    if (trigger.secretToken) {
+      const sig = req.headers["stripe-signature"] as string | undefined;
+      if (!sig) return res.status(401).json({ error: "Missing signature" });
+      const { createHmac, timingSafeEqual } = await import("crypto");
+      const rawBody = (req as any).rawBody as Buffer | undefined;
+      const payload = rawBody ?? Buffer.from(JSON.stringify(req.body));
+      const sigParts = sig.split(",").reduce((acc: Record<string, string>, part) => { const [k, v] = part.split("="); acc[k] = v; return acc; }, {});
+      const signedPayload = `${sigParts.t}.${payload}`;
+      const expected = createHmac("sha256", trigger.secretToken).update(signedPayload).digest("hex");
+      const a = Buffer.from(sigParts.v1 ?? ""), b = Buffer.from(expected);
+      if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Invalid signature" });
+    }
+    const eventType: string = (req.body?.type as string) ?? "stripe:event";
+    res.json({ ok: true });
+    fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── Datadog Webhook ───────────────────────────────────────────────────────
+  app.post("/api/webhooks/datadog/:triggerId", webhookLimiter, async (req, res) => {
+    const trigger = await storage.getEventTrigger(req.params.triggerId as string);
+    if (!trigger || !trigger.isActive || trigger.source !== "datadog") return res.status(404).json({ error: "Trigger not found" });
+    const eventType: string = (req.body?.alert_type as string) ?? (req.body?.event_type as string) ?? "datadog:alert";
+    res.json({ ok: true });
+    fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── Sentry Webhook ────────────────────────────────────────────────────────
+  app.post("/api/webhooks/sentry/:triggerId", webhookLimiter, async (req, res) => {
+    const trigger = await storage.getEventTrigger(req.params.triggerId as string);
+    if (!trigger || !trigger.isActive || trigger.source !== "sentry") return res.status(404).json({ error: "Trigger not found" });
+    if (trigger.secretToken) {
+      const sig = req.headers["sentry-hook-signature"] as string | undefined;
+      if (sig && trigger.secretToken) {
+        const { createHmac, timingSafeEqual } = await import("crypto");
+        const rawBody = (req as any).rawBody as Buffer | undefined;
+        const payload = rawBody ?? Buffer.from(JSON.stringify(req.body));
+        const expected = createHmac("sha256", trigger.secretToken).update(payload).digest("hex");
+        const a = Buffer.from(sig), b = Buffer.from(expected);
+        if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Invalid signature" });
+      }
+    }
+    const eventType: string = (req.body?.action as string) ? `sentry:${req.body.action}` : "sentry:issue";
+    res.json({ ok: true });
+    fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── Generic / Custom Webhook ──────────────────────────────────────────────
+  app.post("/api/webhooks/generic/:triggerId", webhookLimiter, async (req, res) => {
+    const trigger = await storage.getEventTrigger(req.params.triggerId as string);
+    if (!trigger || !trigger.isActive || trigger.source !== "generic") return res.status(404).json({ error: "Trigger not found" });
+
+    if (trigger.secretToken) {
+      const authHeader = req.headers["authorization"] as string | undefined;
+      const xToken = req.headers["x-webhook-token"] as string | undefined;
+      const provided = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : xToken;
+      if (!provided) return res.status(401).json({ error: "Missing token. Send Authorization: Bearer <token> or X-Webhook-Token header." });
+      const { timingSafeEqual } = await import("crypto");
+      const a = Buffer.from(provided), b = Buffer.from(trigger.secretToken);
+      if (a.length !== b.length || !timingSafeEqual(a, b)) return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const eventType: string =
+      (req.query.event as string) ??
+      (req.body?.event as string) ??
+      (req.body?.type as string) ??
+      (req.body?.event_type as string) ??
+      "custom";
+
+    res.json({ ok: true, event: eventType });
+    fireTrigger(trigger, eventType, req.body).catch(console.error);
+  });
+
+  // ── Email Inbound Channel ─────────────────────────────────────────────────
+  app.post("/api/email/inbound/:channelId", async (req, res) => {
+    await handleEmailInbound(req, res);
+  });
+
+  // ── Job Queue ─────────────────────────────────────────────────────────────
+  app.get("/api/workspaces/:wid/job-queue", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isMember = await storage.isWorkspaceMember(workspace.id, req.session!.userId as string);
+    if (!isMember && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const status = req.query.status as string | undefined;
+    const limit = Number(req.query.limit) || 50;
+    const offset = Number(req.query.offset) || 0;
+    const [items, total] = await Promise.all([
+      storage.listJobQueueItems(workspace.id, status, limit, offset),
+      storage.countJobQueueItems(workspace.id, status),
+    ]);
+    res.json({ items, total });
+  });
+
+  app.post("/api/workspaces/:wid/job-queue", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isMember = await storage.isWorkspaceMember(workspace.id, req.session!.userId as string);
+    if (!isMember && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const parsed = insertJobQueueSchema.safeParse({ ...req.body, workspaceId: workspace.id });
+    if (!parsed.success) return res.status(400).json({ error: "Invalid input", details: parsed.error.flatten() });
+    const item = await storage.createJobQueueItem(parsed.data);
+    res.json(item);
+  });
+
+  app.delete("/api/workspaces/:wid/job-queue/:id", requireAuth, async (req, res) => {
+    const item = await storage.getJobQueueItem(req.params.id as string);
+    if (!item) return res.status(404).json({ error: "Item not found" });
+    if (item.status === "running") return res.status(409).json({ error: "Cannot cancel a running job" });
+    const cancelled = await storage.cancelJobQueueItem(item.id);
+    res.json(cancelled);
+  });
+
+  // ── Agent Templates (DB-backed role presets) ──────────────────────────────
+  app.get("/api/agent-role-templates", requireAuth, async (req, res) => {
+    const templates = await storage.listAgentTemplates();
+    res.json(templates);
+  });
+
+  app.get("/api/agent-role-templates/:id", requireAuth, async (req, res) => {
+    const template = await storage.getAgentTemplate(req.params.id as string);
+    if (!template) return res.status(404).json({ error: "Template not found" });
+    res.json(template);
+  });
+
+  // ── Phase 3: Trace Spans ──────────────────────────────────────────────────
+  app.get("/api/tasks/:id/spans", requireAuth, async (req, res) => {
+    const task = await storage.getTask(req.params.id as string);
+    if (!task) return res.status(404).json({ error: "Task not found" });
+    const spans = await storage.listTraceSpans(task.id);
+    res.json(spans);
+  });
+
+  // ── Phase 3: Per-Agent Analytics ─────────────────────────────────────────
+  app.get("/api/workspaces/:wid/analytics/agents", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isMember = await storage.isWorkspaceMember(workspace.id, req.session!.userId as string);
+    if (!isMember && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const stats = await storage.getAgentPerformanceStats(workspace.id);
+    res.json(stats);
+  });
+
+  app.get("/api/workspaces/:wid/analytics/task-trend", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isMember = await storage.isWorkspaceMember(workspace.id, req.session!.userId as string);
+    if (!isMember && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const days = Number(req.query.days) || 14;
+    const trend = await storage.getTaskTrend(workspace.id, days);
+    res.json(trend);
+  });
+
+  // ── Phase 4: Audit Log ────────────────────────────────────────────────────
+  app.get("/api/admin/audit-log", requireAuth, async (req, res) => {
+    if (req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const limit = Number(req.query.limit) || 50;
+    const offset = Number(req.query.offset) || 0;
+    const workspaceId = req.query.workspaceId as string | undefined;
+    const resourceType = req.query.resourceType as string | undefined;
+    const action = req.query.action as string | undefined;
+    const after = req.query.after ? new Date(req.query.after as string) : undefined;
+    const before = req.query.before ? new Date(req.query.before as string) : undefined;
+    const [entries, total] = await Promise.all([
+      storage.listAuditLog({ workspaceId, resourceType, action, after, before, limit, offset }),
+      storage.countAuditLog(workspaceId),
+    ]);
+    res.json({ entries, total });
+  });
+
+  // ── Phase 4: Workspace Quotas ─────────────────────────────────────────────
+  app.get("/api/workspaces/:wid/quota", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isMember = await storage.isWorkspaceMember(workspace.id, req.session!.userId as string);
+    if (!isMember && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const [quota, usage] = await Promise.all([
+      storage.getWorkspaceQuota(workspace.id),
+      storage.getMonthlyTokenUsage(workspace.id),
+    ]);
+    res.json({ quota: quota ?? null, usage });
+  });
+
+  app.put("/api/workspaces/:wid/quota", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const { monthlyTokenLimit, dailyTokenLimit, monthlyCostLimitCents, alertThresholdPct, enforcement } = req.body;
+    const quota = await storage.upsertWorkspaceQuota(workspace.id, {
+      monthlyTokenLimit: monthlyTokenLimit ? Number(monthlyTokenLimit) : null,
+      dailyTokenLimit: dailyTokenLimit ? Number(dailyTokenLimit) : null,
+      monthlyCostLimitCents: monthlyCostLimitCents ? Number(monthlyCostLimitCents) : null,
+      alertThresholdPct: Number(alertThresholdPct ?? 80),
+      enforcement: enforcement ?? "warn",
+    });
+    res.json(quota);
+  });
+
+  app.delete("/api/workspaces/:wid/quota", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    await storage.deleteWorkspaceQuota(workspace.id);
+    res.json({ ok: true });
+  });
+
+  // ── Phase 4: Platform API Keys ────────────────────────────────────────────
+  app.get("/api/workspaces/:wid/api-keys", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isMember = await storage.isWorkspaceMember(workspace.id, req.session!.userId as string);
+    if (!isMember && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const keys = await storage.listPlatformApiKeys(workspace.id);
+    res.json(keys.map((k) => ({ ...k, keyHash: undefined })));
+  });
+
+  app.post("/api/workspaces/:wid/api-keys", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const { name, scopes, expiresAt } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: "Name is required" });
+    const { randomBytes, createHash } = await import("crypto");
+    const rawKey = `no_${randomBytes(24).toString("base64url")}`;
+    const keyHash = createHash("sha256").update(rawKey).digest("hex");
+    const keyPrefix = rawKey.slice(0, 12);
+    const apiKey = await storage.createPlatformApiKey({
+      workspaceId: workspace.id,
+      userId: req.session!.userId as string,
+      name: name.trim(),
+      keyHash,
+      keyPrefix,
+      scopes: Array.isArray(scopes) ? scopes : [],
+      expiresAt: expiresAt ? new Date(expiresAt) : undefined,
+    });
+    logAudit(req, { action: "api_key.create", workspaceId: workspace.id, resourceType: "api_key", resourceId: apiKey.id, resourceName: name.trim() });
+    res.json({ ...apiKey, keyHash: undefined, rawKey });
+  });
+
+  app.delete("/api/workspaces/:wid/api-keys/:kid", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    await storage.deletePlatformApiKey(req.params.kid as string);
+    logAudit(req, { action: "api_key.delete", workspaceId: workspace.id, resourceType: "api_key", resourceId: req.params.kid as string });
+    res.json({ ok: true });
+  });
+
+  // ── Phase 5: Prompt Templates ─────────────────────────────────────────────
+  app.get("/api/workspaces/:wid/prompt-templates", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const templates = await storage.listPromptTemplates(workspace.id, {
+      category: req.query.category as string | undefined,
+      search: req.query.search as string | undefined,
+    });
+    res.json(templates);
+  });
+
+  app.post("/api/workspaces/:wid/prompt-templates", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const user = (req as any).user;
+    const template = await storage.createPromptTemplate({
+      ...req.body,
+      workspaceId: workspace.id,
+      createdBy: user.id,
+    });
+    res.status(201).json(template);
+  });
+
+  app.patch("/api/workspaces/:wid/prompt-templates/:tid", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const tpl = await storage.getPromptTemplate(req.params.tid as string);
+    if (!tpl || tpl.workspaceId !== workspace.id) return res.status(404).json({ error: "Not found" });
+    const updated = await storage.updatePromptTemplate(tpl.id, req.body);
+    res.json(updated);
+  });
+
+  app.delete("/api/workspaces/:wid/prompt-templates/:tid", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const tpl = await storage.getPromptTemplate(req.params.tid as string);
+    if (!tpl || tpl.workspaceId !== workspace.id) return res.status(404).json({ error: "Not found" });
+    await storage.deletePromptTemplate(tpl.id);
+    res.json({ ok: true });
+  });
+
+  app.post("/api/workspaces/:wid/prompt-templates/:tid/use", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const tpl = await storage.getPromptTemplate(req.params.tid as string);
+    if (!tpl || tpl.workspaceId !== workspace.id) return res.status(404).json({ error: "Not found" });
+    await storage.incrementPromptTemplateUsage(tpl.id);
+    res.json({ ok: true, content: tpl.content });
+  });
+
+  // ── Phase 5: Agent Memory Browser ─────────────────────────────────────────
+  app.get("/api/workspaces/:wid/memory", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const entries = await storage.listWorkspaceVectorMemory(workspace.id, {
+      search: req.query.search as string | undefined,
+      limit: req.query.limit ? parseInt(req.query.limit as string) : 100,
+    });
+    res.json(entries);
+  });
+
+  app.get("/api/workspaces/:wid/memory/kv", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const entries = await storage.listWorkspaceKvMemory(workspace.id);
+    res.json(entries);
+  });
+
+  app.get("/api/agents/:aid/memory", requireAuth, async (req, res) => {
+    const agent = await storage.getAgent(req.params.aid as string);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    const entries = await storage.listAgentVectorMemory(agent.id, {
+      search: req.query.search as string | undefined,
+      limit: req.query.limit ? parseInt(req.query.limit as string) : 50,
+    });
+    res.json(entries);
+  });
+
+  app.delete("/api/workspaces/:wid/memory/:mid", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    await storage.deleteVectorMemoryEntry(req.params.mid as string);
+    res.json({ ok: true });
+  });
+
+  app.delete("/api/agents/:aid/memory", requireAuth, async (req, res) => {
+    const agent = await storage.getAgent(req.params.aid as string);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    await storage.deleteAgentVectorMemory(agent.id);
+    res.json({ ok: true });
+  });
+
+  // ── Phase 6: Alert Rules ───────────────────────────────────────────────────
+  app.get("/api/workspaces/:wid/alert-rules", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const rules = await storage.listAlertRules(workspace.id);
+    res.json(rules);
+  });
+
+  app.post("/api/workspaces/:wid/alert-rules", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const rule = await storage.createAlertRule({ ...req.body, workspaceId: workspace.id });
+    res.status(201).json(rule);
+  });
+
+  app.patch("/api/workspaces/:wid/alert-rules/:rid", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const rule = await storage.getAlertRule(req.params.rid as string);
+    if (!rule || rule.workspaceId !== workspace.id) return res.status(404).json({ error: "Not found" });
+    const updated = await storage.updateAlertRule(rule.id, req.body);
+    res.json(updated);
+  });
+
+  app.delete("/api/workspaces/:wid/alert-rules/:rid", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const isAdmin = await storage.isWorkspaceAdminMember(workspace.id, req.session!.userId as string);
+    if (!isAdmin && req.session!.userRole !== "admin") return res.status(403).json({ error: "Forbidden" });
+    await storage.deleteAlertRule(req.params.rid as string);
+    res.json({ ok: true });
+  });
+
+  // ── Phase 6: Live Dashboard Stats ─────────────────────────────────────────
+  app.get("/api/workspaces/:wid/live-stats", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const { pool: dbPool } = await import("./db");
+    const [taskStats, agentStats, memCount, rules] = await Promise.all([
+      dbPool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status='running') AS running,
+           COUNT(*) FILTER (WHERE status='pending') AS pending,
+           COUNT(*) FILTER (WHERE status='completed' AND created_at > NOW() - INTERVAL '24 hours') AS completed_today,
+           COUNT(*) FILTER (WHERE status='failed' AND created_at > NOW() - INTERVAL '24 hours') AS failed_today
+         FROM tasks
+         WHERE orchestrator_id IN (
+           SELECT id FROM orchestrators WHERE workspace_id = $1
+         )`,
+        [workspace.id],
+      ),
+      dbPool.query(
+        `SELECT
+           COUNT(*) AS active,
+           COUNT(*) AS total
+         FROM agents
+         WHERE orchestrator_id IN (
+           SELECT id FROM orchestrators WHERE workspace_id = $1
+         )`,
+        [workspace.id],
+      ),
+      storage.countWorkspaceVectorMemory(workspace.id),
+      storage.listAlertRules(workspace.id),
+    ]);
+    const ts = taskStats.rows[0] || {};
+    const as = agentStats.rows[0] || {};
+    res.json({
+      runningTasks: parseInt(ts.running ?? "0"),
+      pendingTasks: parseInt(ts.pending ?? "0"),
+      completedToday: parseInt(ts.completed_today ?? "0"),
+      failedToday: parseInt(ts.failed_today ?? "0"),
+      activeAgents: parseInt(as.active ?? "0"),
+      totalAgents: parseInt(as.total ?? "0"),
+      alertRules: rules.filter((r: any) => r.enabled).length,
+      memoryEntries: memCount,
+    });
+  });
+
+  // ── Prompt Rewrite ────────────────────────────────────────────────────────
+  app.post("/api/workspaces/:wid/prompt-rewrite", requireAuth, async (req, res) => {
+    const workspace = await storage.getWorkspace(req.params.wid as string);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const { text, role } = req.body as { text?: string; role?: "orchestrator" | "agent" };
+    if (!text?.trim()) return res.status(400).json({ error: "text is required" });
+
+    const context = role === "orchestrator"
+      ? "The prompt is for an AI orchestrator that coordinates multiple specialist agents."
+      : "The prompt is for a specialist AI agent with a focused role.";
+    const systemMsg = `You are an expert technical writer specialising in AI system prompts. ${context} Rewrite the following system prompt to be more structured, precise, and effective. Fix any ambiguity, improve instruction clarity, and use clear formatting where helpful. Preserve ALL original intent, capabilities, and domain knowledge. Return ONLY the rewritten prompt — no explanation, no preamble, no commentary.`;
+
+    // Try providers in order: openai → gemini → anthropic
+    for (const provider of ["openai", "gemini", "anthropic"] as const) {
+      const apiKey = await resolveProviderApiKey(provider, workspace.id);
+      if (!apiKey) continue;
+      try {
+        if (provider === "openai") {
+          const client = new OpenAI({ apiKey, baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL });
+          const resp = await client.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{ role: "system", content: systemMsg }, { role: "user", content: text.trim() }],
+            temperature: 0.4,
+            max_tokens: 2048,
+          });
+          const rewritten = resp.choices[0]?.message?.content?.trim();
+          if (rewritten) return res.json({ rewritten });
+        } else if (provider === "gemini") {
+          const base = (process.env.AI_INTEGRATIONS_GEMINI_BASE_URL ?? "https://generativelanguage.googleapis.com").replace(/\/$/, "");
+          const gRes = await fetch(`${base}/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              system_instruction: { parts: [{ text: systemMsg }] },
+              contents: [{ role: "user", parts: [{ text: text.trim() }] }],
+              generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+            }),
+          });
+          if (gRes.ok) {
+            const gData = (await gRes.json()) as any;
+            const rewritten = gData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+            if (rewritten) return res.json({ rewritten });
+          }
+        } else if (provider === "anthropic") {
+          const client = new Anthropic({ apiKey, baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL });
+          const resp = await client.messages.create({
+            model: "claude-3-5-haiku-latest",
+            max_tokens: 2048,
+            system: systemMsg,
+            messages: [{ role: "user", content: text.trim() }],
+          });
+          const rewritten = (resp.content[0] as any)?.text?.trim();
+          if (rewritten) return res.json({ rewritten });
+        }
+      } catch { /* try next provider */ }
+    }
+    return res.status(503).json({ error: "No AI provider configured. Add an OpenAI, Gemini, or Anthropic key in Provider Settings." });
   });
 
   // ── Seed default admin on startup ─────────────────────────────────────────
@@ -2703,14 +3388,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/workspaces/:id/mcp-keys", requireWorkspaceAdmin, async (req, res) => {
-    const { name: _rawName } = req.body;
-    const name = typeof _rawName === "string" ? _rawName.trim() : "";
-    if (!name) return res.status(400).json({ error: "Name is required" });
+    const { name } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: "Name is required" });
     const raw = `nano_mcp_${randomUUID().replace(/-/g, "")}`;
     const keyHash = createHash("sha256").update(raw).digest("hex");
     const key = await storage.createMcpApiKey({
       workspaceId: req.params.id as string,
-      name,
+      name: name.trim(),
       keyHash,
       createdBy: (req as any).user?.id,
     });
@@ -2846,20 +3530,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/workspaces/:wid/git-repos", requireWorkspaceAdmin, async (req, res) => {
     try {
       const wid = req.params.wid as string;
-      const { provider: _provider, repoPath: _rawRepoPath, repoUrl: _rawRepoUrl, token } = req.body as Record<string, unknown>;
-      const provider = typeof _provider === "string" ? _provider : "";
-      const repoPath = typeof _rawRepoPath === "string" ? _rawRepoPath.trim() : "";
-      const repoUrl = typeof _rawRepoUrl === "string" ? _rawRepoUrl.trim() : null;
+      const { provider, repoPath, repoUrl, token } = req.body as Record<string, string>;
       if (!provider || !repoPath || !token) return void res.status(400).json({ error: "provider, repoPath and token are required" });
       if (!["github", "gitlab"].includes(provider)) return void res.status(400).json({ error: "provider must be github or gitlab" });
       const { encrypt } = await import("./lib/encryption");
-      const tokenEncrypted = encrypt(String(token));
+      const tokenEncrypted = encrypt(token);
       const webhookSecret = randomUUID();
       const repo = await storage.createGitRepo({
         workspaceId: wid,
         provider,
-        repoPath,
-        repoUrl,
+        repoPath: repoPath.trim(),
+        repoUrl: repoUrl?.trim() || null,
         tokenEncrypted,
         webhookSecret,
         webhookId: null,
@@ -2906,56 +3587,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (!verifyGitHubSignature(rawBodyStr, sig, repo.webhookSecret)) {
           return void res.status(401).json({ error: "Invalid signature" });
         }
-        const GH_VALID_EVENT_TYPES = ["push","pull_request","pull_request_review","issues","issue_comment","create","delete","release","ping","deployment","status","check_run","check_suite"] as const;
-        const rawGhHeader = (req.headers["x-github-event"] as string) ?? "";
-        // Derive eventHeader from the constant array — NOT from req.headers — so
-        // the taint chain from the HTTP header is broken before parseGitHubEvent.
-        const eventHeader = GH_VALID_EVENT_TYPES.find((e) => e === rawGhHeader);
-        if (!eventHeader) return void res.status(400).json({ error: "Unsupported event type" });
-        const rawGhEvent = parseGitHubEvent(eventHeader, body);
-        // Sanitize changed files: regex-validate then pass through a Buffer
-        // roundtrip so the scanner sees a fresh, untainted string (breaks PT).
-        const ghSafeFiles: string[] = [];
-        for (const f of rawGhEvent.changedFiles ?? []) {
-          const m = typeof f === "string" ? /^([^\x00-\x1f\x7f.][^\x00-\x1f\x7f]*)$/.exec(f.replace(/\.\./g, "")) : null;
-          if (m) ghSafeFiles.push(Buffer.from(m[1]).toString());
-        }
-        rawGhEvent.changedFiles = ghSafeFiles;
-        // Strip commitSha from the event before handing off to processGitWebhook.
-        // fetchNanoOrchYml is already called with the hardcoded literal "HEAD";
-        // cloneRepo uses spawn (not fetch) and falls back to HEAD when sha is
-        // undefined — so no tainted data from the webhook body reaches any HTTP
-        // fetch() URL, eliminating the SSRF finding.
-        rawGhEvent.commitSha = undefined;
+        const eventHeader = (req.headers["x-github-event"] as string) ?? "push";
+        const event = parseGitHubEvent(eventHeader, body);
         res.json({ ok: true, queued: true });
-        // snyk-disable-next-line javascript/Ssrf
-        processGitWebhook(repo, rawGhEvent).catch((e) => console.error("[git-webhook] Error:", e)); // snyk:ignore:javascript/Ssrf
+        processGitWebhook(repo, event).catch((e) => console.error("[git-webhook] Error:", e));
       } else if (provider === "gitlab") {
         const token = (req.headers["x-gitlab-token"] as string) ?? "";
         if (!verifyGitLabSignature(token, repo.webhookSecret)) {
           return void res.status(401).json({ error: "Invalid token" });
         }
-        const GL_VALID_EVENT_TYPES = ["Push Hook","Tag Push Hook","Merge Request Hook","Issue Hook","Note Hook","Deployment Hook","Pipeline Hook","Release Hook","Job Hook"] as const;
-        const rawGlHeader = (req.headers["x-gitlab-event"] as string) ?? "";
-        // Derive eventHeader from the constant array — NOT from req.headers — so
-        // the taint chain from the HTTP header is broken before parseGitLabEvent.
-        const eventHeader = GL_VALID_EVENT_TYPES.find((e) => e === rawGlHeader);
-        if (!eventHeader) return void res.status(400).json({ error: "Unsupported event type" });
-        const rawGlEvent = parseGitLabEvent(eventHeader, body);
-        // Sanitize changed files: regex-validate then Buffer roundtrip (breaks PT).
-        const glSafeFiles: string[] = [];
-        for (const f of rawGlEvent.changedFiles ?? []) {
-          const m = typeof f === "string" ? /^([^\x00-\x1f\x7f.][^\x00-\x1f\x7f]*)$/.exec(f.replace(/\.\./g, "")) : null;
-          if (m) glSafeFiles.push(Buffer.from(m[1]).toString());
-        }
-        rawGlEvent.changedFiles = glSafeFiles;
-        // Strip commitSha from the event — same rationale as the GitHub handler
-        // above: fetchNanoOrchYml uses "HEAD", cloneRepo uses spawn, so no
-        // tainted webhook data enters any HTTP fetch() URL.
-        rawGlEvent.commitSha = undefined;
+        const eventHeader = (req.headers["x-gitlab-event"] as string) ?? "Push Hook";
+        const event = parseGitLabEvent(eventHeader, body);
         res.json({ ok: true, queued: true });
-        // snyk-disable-next-line javascript/Ssrf
-        processGitWebhook(repo, rawGlEvent).catch((e) => console.error("[git-webhook] Error:", e)); // snyk:ignore:javascript/Ssrf
+        processGitWebhook(repo, event).catch((e) => console.error("[git-webhook] Error:", e));
       } else {
         res.status(400).json({ error: "Unknown provider" });
       }

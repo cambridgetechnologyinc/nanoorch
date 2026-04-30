@@ -157,22 +157,17 @@ export async function executeCodeLocally(
 
   const tmpFile = join(
     tmpdir(),
-    `nanoorch_${Date.now()}_${Math.random().toString(36).slice(2)}.${runner.ext}` // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal -- runner.ext is from a static LOCAL_RUNNERS allowlist, not user input
+    `nanoorch_${Date.now()}_${Math.random().toString(36).slice(2)}.${runner.ext}`
   );
 
   try {
-    writeFileSync(tmpFile, code, "utf-8"); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename
+    writeFileSync(tmpFile, code, "utf-8");
   } catch (err: any) {
     return { stdout: "", stderr: `Failed to write temp file: ${err.message}`, exitCode: 1, infraError: false };
   }
 
-  const ALLOWED_CMDS = new Set(["python3", "node", "bash", "ruby", "Rscript", "go", "java"]);
-  if (!ALLOWED_CMDS.has(runner.cmd)) {
-    return { stdout: "", stderr: `Internal error: disallowed command '${runner.cmd}'`, exitCode: 1, infraError: false };
-  }
-
   return new Promise((resolve) => {
-    const proc = spawn(runner.cmd, [...(runner.extraArgs ?? []), tmpFile]); // nosemgrep: javascript.lang.security.detect-child-process -- runner.cmd is asserted against ALLOWED_CMDS above
+    const proc = spawn(runner.cmd, [...(runner.extraArgs ?? []), tmpFile]);
 
     let stdout = "";
     let stderr = "";
@@ -182,13 +177,13 @@ export async function executeCodeLocally(
 
     const timer = setTimeout(() => {
       proc.kill("SIGKILL");
-      try { unlinkSync(tmpFile); } catch {} // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename
+      try { unlinkSync(tmpFile); } catch {}
       resolve({ stdout: "", stderr: `Execution timed out after ${timeoutSeconds} seconds`, exitCode: 124, infraError: false });
     }, timeoutSeconds * 1000);
 
     proc.on("close", (code) => {
       clearTimeout(timer);
-      try { unlinkSync(tmpFile); } catch {} // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename
+      try { unlinkSync(tmpFile); } catch {}
       resolve({
         stdout: stdout.slice(0, 10000),
         stderr: stderr.slice(0, 5000),
@@ -199,7 +194,7 @@ export async function executeCodeLocally(
 
     proc.on("error", (err) => {
       clearTimeout(timer);
-      try { unlinkSync(tmpFile); } catch {} // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename
+      try { unlinkSync(tmpFile); } catch {}
       const rtLabel: Record<string, string> = {
         python3: "Python", node: "Node.js", bash: "Bash",
         ruby: "Ruby", Rscript: "R (Rscript)", go: "Go", java: "Java",

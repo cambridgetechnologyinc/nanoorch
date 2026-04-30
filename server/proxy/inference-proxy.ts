@@ -17,7 +17,8 @@ import https from "node:https";
 import http from "node:http";
 import { randomBytes } from "crypto";
 import { loadSecret } from "../lib/secrets";
-import { assertSafeUrl } from "../lib/ssrf-guard";
+import { storage } from "../storage";
+import { decrypt } from "../lib/encryption";
 
 // ── Token store ──────────────────────────────────────────────────────────────
 
@@ -91,6 +92,11 @@ export function revokeTaskToken(taskId: string): void {
     byToken.delete(token);
     byTask.delete(taskId);
   }
+  // Purge per-task resolved-key cache entries for all providers
+  const prefix = `${taskId}:`;
+  Array.from(resolvedKeyCache.keys()).forEach((k) => {
+    if (k.startsWith(prefix)) resolvedKeyCache.delete(k);
+  });
 }
 
 function isValidToken(incoming: string): boolean {
@@ -159,6 +165,48 @@ const PROVIDERS: Record<string, ProviderConfig> = {
   },
 };
 
+// ── Per-task resolved-key cache (avoids repeated DB hits on every streaming chunk) ──
+// Key: `${taskId}:${provider}`  Value: real API key string
+const resolvedKeyCache = new Map<string, string>();
+
+async function resolveRealKey(provider: string, cfg: ProviderConfig, taskId: string | null): Promise<string | null> {
+  // 1. Environment variable (fastest — no DB round-trip)
+  const envKey = loadSecret(cfg.secretName);
+  if (envKey) return envKey;
+
+  // 2. DB lookup: try cache first
+  const cacheKey = `${taskId ?? "__no_task"}:${provider}`;
+  const cached = resolvedKeyCache.get(cacheKey);
+  if (cached) return cached;
+
+  // 3. DB lookup: task → orchestrator → workspace key, then platform key
+  try {
+    if (taskId) {
+      const task = await storage.getTask(taskId);
+      if (task?.orchestratorId) {
+        const orch = await storage.getOrchestrator(task.orchestratorId);
+        if (orch) {
+          const wsKey = await storage.getProviderKey((orch as any).workspaceId ?? null, provider);
+          if (wsKey) {
+            const key = decrypt(wsKey.encryptedKey);
+            resolvedKeyCache.set(cacheKey, key);
+            return key;
+          }
+        }
+      }
+    }
+    // 4. Platform-level key (set by superadmin — workspaceId IS NULL)
+    const platformKey = await storage.getProviderKey(null, provider);
+    if (platformKey) {
+      const key = decrypt(platformKey.encryptedKey);
+      resolvedKeyCache.set(cacheKey, key);
+      return key;
+    }
+  } catch { /* fall through */ }
+
+  return null;
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 
 export function createInferenceProxyRouter(): Router {
@@ -167,7 +215,7 @@ export function createInferenceProxyRouter(): Router {
   // Match  /internal/proxy/:provider/<anything>
   // Use router.use so req.path contains the remainder after /:provider —
   // this is the most reliable cross-Express-version catch-all pattern.
-  router.use("/:provider", (req: Request, res: Response) => {
+  router.use("/:provider", async (req: Request, res: Response) => {
     const provider = req.params["provider"] as string;
     const cfg = PROVIDERS[provider];
     if (!cfg) {
@@ -194,8 +242,8 @@ export function createInferenceProxyRouter(): Router {
     // Capture taskId now (before the async proxy response) so we can attribute usage.
     const taskId = byToken.get(incoming)?.taskId ?? null;
 
-    // ── 2. Resolve real key ──────────────────────────────────────────────────
-    const realKey = loadSecret(cfg.secretName);
+    // ── 2. Resolve real key (env var → workspace DB key → platform DB key) ──
+    const realKey = await resolveRealKey(provider, cfg, taskId);
     if (!realKey) {
       res.status(503).json({ error: `Provider '${provider}' is not configured on this server` });
       return;
@@ -204,17 +252,12 @@ export function createInferenceProxyRouter(): Router {
     // ── 3. Build target URL ──────────────────────────────────────────────────
     // req.path is the remainder after /:provider (e.g. /v1/chat/completions).
     // Strip the leading slash so pathSuffix = "v1/chat/completions".
-    // Strip control characters from the path/query to prevent header injection.
-    const pathSuffix = req.path.replace(/^\//, "").replace(/[\x00-\x1f\x7f]/g, "");
+    const pathSuffix = req.path.replace(/^\//, "");
     const baseUrl    = cfg.realBaseUrl().replace(/\/$/, "");
-    try { assertSafeUrl(baseUrl); } catch {
-      res.status(502).json({ error: "Provider base URL is not permitted." });
-      return;
-    }
     let   targetPath = `/${pathSuffix}`;
 
-    // Preserve query string (strip control characters)
-    const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")).replace(/[\x00-\x1f\x7f]/g, "") : "";
+    // Preserve query string
+    const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     if (qs) targetPath += qs;
 
     const targetBase = new URL(baseUrl);

@@ -14,6 +14,7 @@ export interface AgentTemplate {
   category: string;
   categoryLabel: string;
   icon: string;
+  role: string;
   systemPrompt: string;
   tools: string[];
   defaultTemperature: number;
@@ -22,22 +23,23 @@ export interface AgentTemplate {
 }
 
 const CATEGORIES = [
-  { id: "all",          label: "All" },
-  { id: "devops",       label: "DevOps" },
-  { id: "data",         label: "Data" },
-  { id: "security",     label: "Security" },
-  { id: "communication",label: "Communication" },
-  { id: "engineering",  label: "Engineering" },
-  { id: "general",      label: "General" },
+  { id: "all",            label: "All" },
+  { id: "infrastructure", label: "Infrastructure" },
+  { id: "data",           label: "Data" },
+  { id: "security",       label: "Security" },
+  { id: "communication",  label: "Communication" },
+  { id: "engineering",    label: "Engineering" },
+  { id: "general",        label: "General" },
 ];
 
 const CATEGORY_COLORS: Record<string, string> = {
-  devops:       "bg-blue-500/15 text-blue-400 border-blue-500/30",
-  data:         "bg-violet-500/15 text-violet-400 border-violet-500/30",
-  security:     "bg-red-500/15 text-red-400 border-red-500/30",
-  communication:"bg-green-500/15 text-green-400 border-green-500/30",
-  engineering:  "bg-orange-500/15 text-orange-400 border-orange-500/30",
-  general:      "bg-muted text-muted-foreground border-border",
+  infrastructure: "bg-blue-500/15 text-blue-400 border-blue-500/30",
+  devops:         "bg-blue-500/15 text-blue-400 border-blue-500/30",
+  data:           "bg-violet-500/15 text-violet-400 border-violet-500/30",
+  security:       "bg-red-500/15 text-red-400 border-red-500/30",
+  communication:  "bg-green-500/15 text-green-400 border-green-500/30",
+  engineering:    "bg-orange-500/15 text-orange-400 border-orange-500/30",
+  general:        "bg-muted text-muted-foreground border-border",
 };
 
 interface Props {

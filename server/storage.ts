@@ -1,4 +1,4 @@
-import { eq, desc, and, inArray, sql, gte, count } from "drizzle-orm";
+import { eq, desc, and, inArray, sql, gte, count, lte, lt } from "drizzle-orm";
 import { db, pool } from "./db";
 import {
   users, workspaces, workspaceMembers, orchestrators, agents, channels, channelDeliveries, tasks, taskLogs, agentMemory, cloudIntegrations,
@@ -6,6 +6,8 @@ import {
   approvalRequests, pipelines, pipelineSteps, pipelineRuns, pipelineStepRuns, tokenUsage,
   workspaceConfig, commsThreads, ssoProviders, eventTriggers, triggerEvents, mcpApiKeys,
   gitAgents, gitRepos, gitAgentRuns, globalSettings, providerKeys,
+  jobQueue, agentTemplates, emailThreads,
+  traceSpans, auditLog, workspaceQuotas, platformApiKeys, promptTemplates, alertRules,
   type User, type InsertUser,
   type Workspace, type InsertWorkspace,
   type Orchestrator, type InsertOrchestrator,
@@ -36,6 +38,13 @@ import {
   type GitAgentRun,
   type GlobalSettings,
   type ProviderKey,
+  type JobQueueItem, type InsertJobQueueItem,
+  type AgentTemplate,
+  type EmailThread,
+  type TraceSpan, type InsertTraceSpan,
+  type AuditLogEntry,
+  type WorkspaceQuota, type InsertWorkspaceQuota,
+  type PlatformApiKey,
 } from "@shared/schema";
 
 export type WorkspaceMemberWithUser = {
@@ -113,6 +122,7 @@ export interface IStorage {
   getAgentMemory(agentId: string, key: string): Promise<string | null>;
   setAgentMemory(agentId: string, key: string, value: string): Promise<void>;
   listAgentMemory(agentId: string): Promise<AgentMemory[]>;
+  listWorkspaceKvMemory(workspaceId: string): Promise<Array<{ id: string; agentId: string; agentName: string; key: string; value: string; updatedAt: Date }>>;
 
   storeVectorMemory(agentId: string, workspaceId: string, content: string, embedding: number[], source: string, taskId?: string): Promise<void>;
   retrieveVectorMemories(agentId: string, workspaceId: string, queryEmbedding: number[], limit?: number): Promise<Array<{ content: string; source: string; similarity: number }>>;
@@ -260,6 +270,49 @@ export interface IStorage {
   getProviderKey(workspaceId: string | null, provider: string): Promise<ProviderKey | null>;
   upsertProviderKey(workspaceId: string | null, provider: string, encryptedKey: string, baseUrl: string | null, label: string | null, updatedBy: string | null): Promise<ProviderKey>;
   deleteProviderKey(workspaceId: string | null, provider: string): Promise<void>;
+
+  // Job Queue
+  listJobQueueItems(workspaceId: string, status?: string, limit?: number, offset?: number): Promise<JobQueueItem[]>;
+  countJobQueueItems(workspaceId: string, status?: string): Promise<number>;
+  getJobQueueItem(id: string): Promise<JobQueueItem | undefined>;
+  createJobQueueItem(data: InsertJobQueueItem): Promise<JobQueueItem>;
+  updateJobQueueItem(id: string, data: Partial<JobQueueItem>): Promise<JobQueueItem>;
+  cancelJobQueueItem(id: string): Promise<JobQueueItem>;
+  dequeuePendingItems(limit: number): Promise<JobQueueItem[]>;
+
+  // Agent Templates
+  listAgentTemplates(): Promise<AgentTemplate[]>;
+  getAgentTemplate(id: string): Promise<AgentTemplate | undefined>;
+
+  // Email Threads
+  getEmailThread(channelId: string, messageId: string): Promise<EmailThread | undefined>;
+  createEmailThread(data: { channelId: string; messageId: string; fromEmail: string; fromName: string | null; subject: string | null; agentId: string | null }): Promise<EmailThread>;
+  touchEmailThread(id: string): Promise<void>;
+
+  // Audit Log
+  createAuditEntry(data: {
+    workspaceId?: string | null;
+    userId?: number | null;
+    username?: string | null;
+    action: string;
+    resourceType?: string | null;
+    resourceId?: string | null;
+    resourceName?: string | null;
+    details?: Record<string, unknown> | null;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+  }): Promise<void>;
+  listAuditLog(opts: {
+    workspaceId?: string;
+    userId?: string;
+    action?: string;
+    resourceType?: string;
+    after?: Date;
+    before?: Date;
+    limit?: number;
+    offset?: number;
+  }): Promise<AuditLogEntry[]>;
+  countAuditLog(workspaceId?: string): Promise<number>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -607,6 +660,19 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(agentMemory).where(eq(agentMemory.agentId, agentId));
   }
 
+  async listWorkspaceKvMemory(workspaceId: string) {
+    const rows = await db.execute(sql`
+      SELECT am.id::text, am.agent_id AS "agentId", a.name AS "agentName",
+             am.key, am.value, am.updated_at AS "updatedAt"
+      FROM agent_memory am
+      JOIN agents a ON a.id = am.agent_id
+      JOIN orchestrators o ON o.id = a.orchestrator_id
+      WHERE o.workspace_id = ${workspaceId}
+      ORDER BY am.updated_at DESC
+    `);
+    return rows.rows as Array<{ id: string; agentId: string; agentName: string; key: string; value: string; updatedAt: Date }>;
+  }
+
   async storeVectorMemory(
     agentId: string,
     workspaceId: string,
@@ -759,6 +825,7 @@ export class DatabaseStorage implements IStorage {
         heartbeatLastFiredAt: agents.heartbeatLastFiredAt,
         heartbeatNotifyChannelId: agents.heartbeatNotifyChannelId,
         createdAt: agents.createdAt,
+        role: agents.role,
         orchestratorName: orchestrators.name,
         provider: orchestrators.provider,
         model: orchestrators.model,
@@ -1488,6 +1555,393 @@ export class DatabaseStorage implements IStorage {
     if (existing) {
       await db.delete(providerKeys).where(eq(providerKeys.id, existing.id));
     }
+  }
+
+  // ── Job Queue ────────────────────────────────────────────────────────────────
+  async listJobQueueItems(workspaceId: string, status?: string, limit = 50, offset = 0): Promise<JobQueueItem[]> {
+    const conditions = [eq(jobQueue.workspaceId, workspaceId)];
+    if (status) conditions.push(eq(jobQueue.status, status as any));
+    return db.select().from(jobQueue).where(and(...conditions)).orderBy(desc(jobQueue.createdAt)).limit(limit).offset(offset);
+  }
+
+  async countJobQueueItems(workspaceId: string, status?: string): Promise<number> {
+    const conditions = [eq(jobQueue.workspaceId, workspaceId)];
+    if (status) conditions.push(eq(jobQueue.status, status as any));
+    const [{ value }] = await db.select({ value: count() }).from(jobQueue).where(and(...conditions));
+    return Number(value);
+  }
+
+  async getJobQueueItem(id: string): Promise<JobQueueItem | undefined> {
+    const [row] = await db.select().from(jobQueue).where(eq(jobQueue.id, id));
+    return row;
+  }
+
+  async createJobQueueItem(data: InsertJobQueueItem): Promise<JobQueueItem> {
+    const [row] = await db.insert(jobQueue).values(data as any).returning();
+    return row;
+  }
+
+  async updateJobQueueItem(id: string, data: Partial<JobQueueItem>): Promise<JobQueueItem> {
+    const [row] = await db.update(jobQueue).set(data as any).where(eq(jobQueue.id, id)).returning();
+    return row;
+  }
+
+  async cancelJobQueueItem(id: string): Promise<JobQueueItem> {
+    const [row] = await db.update(jobQueue).set({ status: "cancelled", completedAt: new Date() }).where(eq(jobQueue.id, id)).returning();
+    return row;
+  }
+
+  async dequeuePendingItems(limit: number): Promise<JobQueueItem[]> {
+    const now = new Date();
+    return db.select().from(jobQueue).where(
+      and(
+        eq(jobQueue.status, "pending"),
+        sql`(${jobQueue.scheduledFor} IS NULL OR ${jobQueue.scheduledFor} <= ${now})`
+      )
+    ).orderBy(desc(jobQueue.priority), jobQueue.createdAt).limit(limit);
+  }
+
+  // ── Agent Templates ──────────────────────────────────────────────────────────
+  async listAgentTemplates(): Promise<AgentTemplate[]> {
+    return db.select().from(agentTemplates).orderBy(agentTemplates.category, agentTemplates.name);
+  }
+
+  async getAgentTemplate(id: string): Promise<AgentTemplate | undefined> {
+    const [row] = await db.select().from(agentTemplates).where(eq(agentTemplates.id, id));
+    return row;
+  }
+
+  // ── Email Threads ─────────────────────────────────────────────────────────────
+  async getEmailThread(channelId: string, messageId: string): Promise<EmailThread | undefined> {
+    const [row] = await db.select().from(emailThreads).where(
+      and(eq(emailThreads.channelId, channelId), eq(emailThreads.messageId, messageId))
+    );
+    return row;
+  }
+
+  async createEmailThread(data: { channelId: string; messageId: string; fromEmail: string; fromName: string | null; subject: string | null; agentId: string | null }): Promise<EmailThread> {
+    const [row] = await db.insert(emailThreads).values(data as any).returning();
+    return row;
+  }
+
+  async touchEmailThread(id: string): Promise<void> {
+    await db.update(emailThreads).set({ lastActivityAt: new Date() }).where(eq(emailThreads.id, id));
+  }
+
+  // ── Trace Spans (Phase 3) ─────────────────────────────────────────────────────
+  async createTraceSpan(data: InsertTraceSpan): Promise<TraceSpan> {
+    const [row] = await db.insert(traceSpans).values(data as any).returning();
+    return row;
+  }
+
+  async updateTraceSpan(id: string, data: Partial<Pick<TraceSpan, "status" | "output" | "endedAt" | "durationMs" | "metadata">>): Promise<void> {
+    await db.update(traceSpans).set(data as any).where(eq(traceSpans.id, id));
+  }
+
+  async listTraceSpans(taskId: string): Promise<TraceSpan[]> {
+    return db.select().from(traceSpans).where(eq(traceSpans.taskId, taskId)).orderBy(traceSpans.seq);
+  }
+
+  // ── Audit Log (Phase 4) ───────────────────────────────────────────────────────
+  async createAuditEntry(data: {
+    workspaceId?: string | null;
+    userId?: number | null;
+    username?: string | null;
+    action: string;
+    resourceType?: string | null;
+    resourceId?: string | null;
+    resourceName?: string | null;
+    details?: Record<string, unknown> | null;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+  }): Promise<void> {
+    await db.insert(auditLog).values(data as any);
+  }
+
+  async listAuditLog(opts: {
+    workspaceId?: string;
+    userId?: string;
+    action?: string;
+    resourceType?: string;
+    limit?: number;
+    offset?: number;
+    after?: Date;
+    before?: Date;
+  }): Promise<AuditLogEntry[]> {
+    const conditions: any[] = [];
+    if (opts.workspaceId) conditions.push(eq(auditLog.workspaceId, opts.workspaceId));
+    if (opts.userId) conditions.push(eq(auditLog.userId, opts.userId));
+    if (opts.action) conditions.push(eq(auditLog.action, opts.action));
+    if (opts.resourceType) conditions.push(eq(auditLog.resourceType, opts.resourceType));
+    if (opts.after) conditions.push(gte(auditLog.createdAt, opts.after));
+    if (opts.before) conditions.push(lt(auditLog.createdAt, opts.before));
+    let q = db.select().from(auditLog);
+    if (conditions.length > 0) q = q.where(and(...conditions)) as any;
+    return (q as any).orderBy(desc(auditLog.createdAt)).limit(opts.limit ?? 50).offset(opts.offset ?? 0);
+  }
+
+  async countAuditLog(workspaceId?: string): Promise<number> {
+    const conditions = workspaceId ? [eq(auditLog.workspaceId, workspaceId)] : [];
+    const [row] = await (conditions.length > 0
+      ? db.select({ n: count() }).from(auditLog).where(and(...conditions))
+      : db.select({ n: count() }).from(auditLog));
+    return Number(row?.n ?? 0);
+  }
+
+  // ── Workspace Quotas (Phase 4) ────────────────────────────────────────────────
+  async getWorkspaceQuota(workspaceId: string): Promise<WorkspaceQuota | undefined> {
+    const [row] = await db.select().from(workspaceQuotas).where(eq(workspaceQuotas.workspaceId, workspaceId));
+    return row;
+  }
+
+  async upsertWorkspaceQuota(workspaceId: string, data: Partial<InsertWorkspaceQuota>): Promise<WorkspaceQuota> {
+    const payload = { ...data, workspaceId, updatedAt: new Date() };
+    const [row] = await db.insert(workspaceQuotas).values(payload as any)
+      .onConflictDoUpdate({ target: workspaceQuotas.workspaceId, set: { ...data, updatedAt: new Date() } as any })
+      .returning();
+    return row;
+  }
+
+  async deleteWorkspaceQuota(workspaceId: string): Promise<void> {
+    await db.delete(workspaceQuotas).where(eq(workspaceQuotas.workspaceId, workspaceId));
+  }
+
+  // ── Platform API Keys (Phase 4) ───────────────────────────────────────────────
+  async listPlatformApiKeys(workspaceId: string): Promise<PlatformApiKey[]> {
+    return db.select().from(platformApiKeys)
+      .where(eq(platformApiKeys.workspaceId, workspaceId))
+      .orderBy(desc(platformApiKeys.createdAt));
+  }
+
+  async createPlatformApiKey(data: {
+    workspaceId: string;
+    userId?: string;
+    name: string;
+    keyHash: string;
+    keyPrefix: string;
+    scopes?: string[];
+    expiresAt?: Date;
+  }): Promise<PlatformApiKey> {
+    const [row] = await db.insert(platformApiKeys).values(data as any).returning();
+    return row;
+  }
+
+  async getPlatformApiKeyByHash(keyHash: string): Promise<PlatformApiKey | undefined> {
+    const [row] = await db.select().from(platformApiKeys).where(eq(platformApiKeys.keyHash, keyHash));
+    return row;
+  }
+
+  async touchPlatformApiKey(id: string): Promise<void> {
+    await db.update(platformApiKeys).set({ lastUsedAt: new Date() }).where(eq(platformApiKeys.id, id));
+  }
+
+  async deletePlatformApiKey(id: string): Promise<void> {
+    await db.delete(platformApiKeys).where(eq(platformApiKeys.id, id));
+  }
+
+  // ── Per-Agent Analytics (Phase 3) ────────────────────────────────────────────
+  async getAgentPerformanceStats(workspaceId: string): Promise<Array<{
+    agentId: string;
+    agentName: string;
+    totalRuns: number;
+    completed: number;
+    failed: number;
+    avgDurationMs: number | null;
+    p95DurationMs: number | null;
+    successRate: number;
+  }>> {
+    const rows = await db.execute(sql`
+      SELECT
+        a.id                                              AS "agentId",
+        a.name                                            AS "agentName",
+        COUNT(t.id)::int                                  AS "totalRuns",
+        COUNT(t.id) FILTER (WHERE t.status = 'completed')::int AS "completed",
+        COUNT(t.id) FILTER (WHERE t.status = 'failed')::int    AS "failed",
+        AVG(EXTRACT(EPOCH FROM (t.completed_at - t.started_at)) * 1000)::int AS "avgDurationMs",
+        PERCENTILE_CONT(0.95) WITHIN GROUP (
+          ORDER BY EXTRACT(EPOCH FROM (t.completed_at - t.started_at)) * 1000
+        )::int AS "p95DurationMs"
+      FROM agents a
+      JOIN orchestrators o ON o.id = a.orchestrator_id
+      LEFT JOIN tasks t ON t.agent_id = a.id
+        AND t.started_at IS NOT NULL
+        AND t.completed_at IS NOT NULL
+      WHERE o.workspace_id = ${workspaceId}
+      GROUP BY a.id, a.name
+      ORDER BY "totalRuns" DESC
+    `);
+    return (rows.rows as any[]).map((r) => ({
+      ...r,
+      successRate: r.totalRuns > 0 ? Math.round((r.completed / r.totalRuns) * 100) : 0,
+    }));
+  }
+
+  async getTaskTrend(workspaceId: string, days = 14): Promise<Array<{
+    date: string;
+    completed: number;
+    failed: number;
+    total: number;
+  }>> {
+    const rows = await db.execute(sql`
+      SELECT
+        DATE(t.created_at)::text                                   AS date,
+        COUNT(t.id) FILTER (WHERE t.status = 'completed')::int     AS completed,
+        COUNT(t.id) FILTER (WHERE t.status = 'failed')::int        AS failed,
+        COUNT(t.id)::int                                           AS total
+      FROM tasks t
+      JOIN agents a ON a.id = t.agent_id
+      JOIN orchestrators o ON o.id = a.orchestrator_id
+      WHERE o.workspace_id = ${workspaceId}
+        AND t.created_at >= NOW() - (${days} || ' days')::interval
+      GROUP BY DATE(t.created_at)
+      ORDER BY date ASC
+    `);
+    return rows.rows as any[];
+  }
+
+  // ── Monthly token usage for quota check ─────────────────────────────────────
+  async getMonthlyTokenUsage(workspaceId: string): Promise<{ totalTokens: number; estimatedCostCents: number }> {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const result = await db.execute(sql`
+      SELECT
+        COALESCE(SUM(tu.input_tokens + tu.output_tokens), 0)::bigint AS "totalTokens",
+        COALESCE(SUM(tu.estimated_cost_usd * 100), 0)::int AS "estimatedCostCents"
+      FROM token_usage tu
+      WHERE tu.workspace_id = ${workspaceId}
+        AND tu.created_at >= ${startOfMonth}
+    `);
+    const row = (result as any).rows?.[0] ?? result;
+    return {
+      totalTokens: Number(row?.totalTokens ?? 0),
+      estimatedCostCents: Number(row?.estimatedCostCents ?? 0),
+    };
+  }
+
+  // ── Phase 5: Prompt Templates ─────────────────────────────────────────────────
+  async listPromptTemplates(workspaceId: string, opts?: { category?: string; search?: string }): Promise<any[]> {
+    let query = db.select().from(promptTemplates).where(eq(promptTemplates.workspaceId, workspaceId));
+    const rows = await query.orderBy(desc(promptTemplates.usageCount));
+    let results = rows;
+    if (opts?.category && opts.category !== "all") {
+      results = results.filter((r) => r.category === opts.category);
+    }
+    if (opts?.search) {
+      const q = opts.search.toLowerCase();
+      results = results.filter((r) =>
+        r.name.toLowerCase().includes(q) ||
+        r.description?.toLowerCase().includes(q) ||
+        r.content.toLowerCase().includes(q)
+      );
+    }
+    return results;
+  }
+
+  async getPromptTemplate(id: string): Promise<any | null> {
+    const [row] = await db.select().from(promptTemplates).where(eq(promptTemplates.id, id));
+    return row ?? null;
+  }
+
+  async createPromptTemplate(data: any): Promise<any> {
+    const [row] = await db.insert(promptTemplates).values(data).returning();
+    return row;
+  }
+
+  async updatePromptTemplate(id: string, data: Partial<any>): Promise<any | null> {
+    const [row] = await db.update(promptTemplates).set({ ...data, updatedAt: new Date() }).where(eq(promptTemplates.id, id)).returning();
+    return row ?? null;
+  }
+
+  async deletePromptTemplate(id: string): Promise<void> {
+    await db.delete(promptTemplates).where(eq(promptTemplates.id, id));
+  }
+
+  async incrementPromptTemplateUsage(id: string): Promise<void> {
+    await db.execute(sql`UPDATE prompt_templates SET usage_count = usage_count + 1 WHERE id = ${id}`);
+  }
+
+  // ── Phase 5: Agent Vector Memory Browser ─────────────────────────────────────
+  async listAgentVectorMemory(agentId: string, opts?: { search?: string; limit?: number }): Promise<any[]> {
+    const limit = opts?.limit ?? 50;
+    const searchClause = opts?.search ? `AND content ILIKE '%${opts.search.replace(/'/g, "''")}%'` : "";
+    const rows = await pool.query(
+      `SELECT id, agent_id, workspace_id, task_id, content, source, created_at
+       FROM agent_memory_vectors
+       WHERE agent_id = $1 ${searchClause}
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [agentId, limit],
+    );
+    return rows.rows;
+  }
+
+  async listWorkspaceVectorMemory(workspaceId: string, opts?: { search?: string; limit?: number }): Promise<any[]> {
+    const limit = opts?.limit ?? 100;
+    const searchClause = opts?.search ? `AND amv.content ILIKE '%${opts.search.replace(/'/g, "''")}%'` : "";
+    const rows = await pool.query(
+      `SELECT amv.id, amv.agent_id, amv.workspace_id, amv.task_id, amv.content, amv.source, amv.created_at,
+              a.name AS agent_name
+       FROM agent_memory_vectors amv
+       JOIN agents a ON a.id = amv.agent_id
+       WHERE amv.workspace_id = $1 ${searchClause}
+       ORDER BY amv.created_at DESC
+       LIMIT $2`,
+      [workspaceId, limit],
+    );
+    return rows.rows;
+  }
+
+  async countWorkspaceVectorMemory(workspaceId: string): Promise<number> {
+    const rows = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM agent_memory_vectors WHERE workspace_id = $1`,
+      [workspaceId],
+    );
+    return rows.rows[0]?.cnt ?? 0;
+  }
+
+  async deleteVectorMemoryEntry(id: string): Promise<void> {
+    await pool.query(`DELETE FROM agent_memory_vectors WHERE id = $1`, [id]);
+  }
+
+  async deleteAgentVectorMemory(agentId: string): Promise<void> {
+    await pool.query(`DELETE FROM agent_memory_vectors WHERE agent_id = $1`, [agentId]);
+  }
+
+  // ── Phase 6: Alert Rules ──────────────────────────────────────────────────────
+  async listAlertRules(workspaceId: string): Promise<any[]> {
+    return db.select().from(alertRules).where(eq(alertRules.workspaceId, workspaceId)).orderBy(desc(alertRules.createdAt));
+  }
+
+  async getAlertRule(id: string): Promise<any | null> {
+    const [row] = await db.select().from(alertRules).where(eq(alertRules.id, id));
+    return row ?? null;
+  }
+
+  async createAlertRule(data: any): Promise<any> {
+    const [row] = await db.insert(alertRules).values(data).returning();
+    return row;
+  }
+
+  async updateAlertRule(id: string, data: Partial<any>): Promise<any | null> {
+    const [row] = await db.update(alertRules).set({ ...data, updatedAt: new Date() }).where(eq(alertRules.id, id)).returning();
+    return row ?? null;
+  }
+
+  async deleteAlertRule(id: string): Promise<void> {
+    await db.delete(alertRules).where(eq(alertRules.id, id));
+  }
+
+  async recordAlertTrigger(id: string): Promise<void> {
+    await db.execute(sql`
+      UPDATE alert_rules
+      SET last_triggered_at = now(), trigger_count = trigger_count + 1, updated_at = now()
+      WHERE id = ${id}
+    `);
+  }
+
+  async getEnabledAlertRules(workspaceId: string): Promise<any[]> {
+    return db.select().from(alertRules)
+      .where(and(eq(alertRules.workspaceId, workspaceId), eq(alertRules.enabled, true)));
   }
 }
 

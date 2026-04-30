@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { Plus, Bot, Trash2, Edit, Brain, Thermometer, Wrench, ChevronDown, ChevronRight, Database, Cloud, Timer, GitBranch, Heart, Zap, Clock, MessageSquare, Users, LayoutTemplate } from "lucide-react";
+import { Plus, Bot, Trash2, Edit, Brain, Thermometer, Wrench, ChevronDown, ChevronRight, Database, Cloud, Timer, GitBranch, Heart, Zap, Clock, MessageSquare, Users, LayoutTemplate, Sparkles, Loader2, Undo2 } from "lucide-react";
 import TemplateGalleryDialog, { type AgentTemplate } from "@/components/TemplateGalleryDialog";
 import { SiJira, SiGithub, SiGitlab, SiSlack } from "react-icons/si";
 import { Button } from "@/components/ui/button";
@@ -24,6 +24,28 @@ interface Props {
   workspaceId: string;
 }
 
+const ROLE_OPTIONS = [
+  { value: "custom",       label: "Custom",              color: "bg-muted text-muted-foreground border-border" },
+  { value: "devops",       label: "DevOps",              color: "bg-blue-500/15 text-blue-400 border-blue-500/30" },
+  { value: "data_analyst", label: "Data Analyst",        color: "bg-violet-500/15 text-violet-400 border-violet-500/30" },
+  { value: "support",      label: "Support",             color: "bg-green-500/15 text-green-400 border-green-500/30" },
+  { value: "code_review",  label: "Code Review",         color: "bg-orange-500/15 text-orange-400 border-orange-500/30" },
+  { value: "security",     label: "Security",            color: "bg-red-500/15 text-red-400 border-red-500/30" },
+  { value: "git_ops",      label: "GitOps",              color: "bg-cyan-500/15 text-cyan-400 border-cyan-500/30" },
+  { value: "monitoring",   label: "Monitoring",          color: "bg-yellow-500/15 text-yellow-400 border-yellow-500/30" },
+];
+
+function RoleBadge({ role }: { role: string | null | undefined }) {
+  if (!role || role === "custom") return null;
+  const opt = ROLE_OPTIONS.find((r) => r.value === role);
+  if (!opt) return null;
+  return (
+    <Badge variant="outline" className={`text-[10px] border ${opt.color}`}>
+      {opt.label}
+    </Badge>
+  );
+}
+
 interface AgentForm {
   name: string;
   description: string;
@@ -34,6 +56,7 @@ interface AgentForm {
   reactEnabled: boolean;
   tools: string[];
   sandboxTimeoutSeconds: number | null;
+  role: string;
   heartbeatEnabled: boolean;
   heartbeatIntervalMinutes: number;
   heartbeatChecklist: string;
@@ -53,6 +76,7 @@ const defaultForm: AgentForm = {
   reactEnabled: false,
   tools: [],
   sandboxTimeoutSeconds: null,
+  role: "custom",
   heartbeatEnabled: false,
   heartbeatIntervalMinutes: 30,
   heartbeatChecklist: "",
@@ -150,6 +174,10 @@ const PROVIDER_TOOLS: Record<string, { name: string; label: string; description:
     { name: "servicenow_get_catalog_items", label: "Get Catalog Items", description: "List items from the service catalog" },
   ],
   postgresql: [
+    // Server-level
+    { name: "pg_list_databases", label: "List Databases", description: "List all databases on the PostgreSQL server with size and encoding" },
+    { name: "pg_create_database", label: "Create Database", description: "Create a new database on the server — requires approval" },
+    { name: "pg_drop_database", label: "Drop Database", description: "Permanently drop a database and all its objects — requires approval" },
     // Query & Read
     { name: "pg_list_schemas", label: "List Schemas", description: "List all non-system schemas in the database" },
     { name: "pg_list_tables", label: "List Tables", description: "List tables with type and estimated row count" },
@@ -317,6 +345,32 @@ export default function AgentsPage({ orchestratorId, workspaceId }: Props) {
   const [form, setForm] = useState<AgentForm>(defaultForm);
   const [templateGalleryOpen, setTemplateGalleryOpen] = useState(false);
   const [appliedTemplate, setAppliedTemplate] = useState<string | null>(null);
+  const [prevInstructions, setPrevInstructions] = useState<string | null>(null);
+
+  const rewriteInstructionsMutation = useMutation({
+    mutationFn: async (text: string) => {
+      const res = await apiRequest("POST", `/api/workspaces/${workspaceId}/prompt-rewrite`, { text, role: "agent" });
+      return res.json();
+    },
+    onSuccess: (data: any) => {
+      const original = form.instructions;
+      setForm((f) => ({ ...f, instructions: data.rewritten }));
+      setPrevInstructions(original);
+      toast({
+        title: "Instructions rewritten",
+        description: "AI improved your agent instructions.",
+        action: (
+          <button
+            className="text-xs underline text-primary"
+            onClick={() => { setForm((f) => ({ ...f, instructions: original })); setPrevInstructions(null); }}
+          >
+            Undo
+          </button>
+        ) as any,
+      });
+    },
+    onError: (err: any) => toast({ title: "Rewrite failed", description: err.message, variant: "destructive" }),
+  });
 
   const { data: agents, isLoading } = useQuery<Agent[]>({
     queryKey: [`/api/orchestrators/${orchestratorId}/agents`],
@@ -385,6 +439,7 @@ export default function AgentsPage({ orchestratorId, workspaceId }: Props) {
       tools: template.tools,
       temperature: template.defaultTemperature,
       maxTokens: template.defaultMaxTokens,
+      role: template.role ?? "custom",
     });
     setOpen(true);
   };
@@ -401,6 +456,7 @@ export default function AgentsPage({ orchestratorId, workspaceId }: Props) {
       reactEnabled: agent.reactEnabled ?? false,
       tools: Array.isArray(agent.tools) ? (agent.tools as string[]) : [],
       sandboxTimeoutSeconds: agent.sandboxTimeoutSeconds ?? null,
+      role: (agent as any).role ?? "custom",
       heartbeatEnabled: agent.heartbeatEnabled ?? false,
       heartbeatIntervalMinutes: agent.heartbeatIntervalMinutes ?? 30,
       heartbeatChecklist: agent.heartbeatChecklist ?? "",
@@ -504,7 +560,10 @@ export default function AgentsPage({ orchestratorId, workspaceId }: Props) {
                       </Button>
                     </div>
                   </div>
-                  <CardTitle className="text-base">{agent.name}</CardTitle>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <CardTitle className="text-base">{agent.name}</CardTitle>
+                    <RoleBadge role={(agent as any).role} />
+                  </div>
                   {agent.description && <p className="text-xs text-muted-foreground">{agent.description}</p>}
                 </CardHeader>
                 <CardContent>
@@ -587,9 +646,46 @@ export default function AgentsPage({ orchestratorId, workspaceId }: Props) {
                 placeholder="Optional description" className="mt-1" />
             </div>
             <div>
-              <Label>Instructions</Label>
-              <Textarea value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })}
-                placeholder="You are a research agent specialized in..." className="mt-1 font-mono text-sm" rows={4}
+              <Label>Role</Label>
+              <Select value={form.role} onValueChange={(v) => setForm({ ...form, role: v })}>
+                <SelectTrigger className="mt-1" data-testid="select-agent-role">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ROLE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <Label>Instructions</Label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs gap-1 text-muted-foreground hover:text-primary"
+                  disabled={rewriteInstructionsMutation.isPending || (!prevInstructions && !form.instructions.trim())}
+                  onClick={() => {
+                    if (prevInstructions !== null) {
+                      setForm({ ...form, instructions: prevInstructions });
+                      setPrevInstructions(null);
+                    } else {
+                      rewriteInstructionsMutation.mutate(form.instructions);
+                    }
+                  }}
+                  data-testid="button-rewrite-instructions"
+                >
+                  {rewriteInstructionsMutation.isPending
+                    ? <><Loader2 className="w-3 h-3 animate-spin" /> Rewriting…</>
+                    : prevInstructions
+                      ? <><Undo2 className="w-3 h-3" /> Undo</>
+                      : <><Sparkles className="w-3 h-3" /> Rewrite</>}
+                </Button>
+              </div>
+              <Textarea value={form.instructions} onChange={(e) => { setForm({ ...form, instructions: e.target.value }); setPrevInstructions(null); }}
+                placeholder="You are a research agent specialized in..." className="font-mono text-sm" rows={4}
                 data-testid="input-agent-instructions" />
             </div>
             <div className="grid grid-cols-2 gap-4">

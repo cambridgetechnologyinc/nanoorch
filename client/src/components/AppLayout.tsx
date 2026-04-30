@@ -5,7 +5,7 @@ import {
   Bot, LayoutDashboard, Network, Radio, ListTodo, ChevronLeft,
   Moon, Sun, Zap, Plug, MessageSquare, Users, LogOut, Clock,
   ShieldAlert, GitBranch, BarChart2, Webhook, PanelLeftClose, PanelLeftOpen,
-  GitFork, GitPullRequest,
+  GitFork, GitPullRequest, LayoutTemplate, ListOrdered, BookOpen, Brain, BellRing,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -72,13 +72,18 @@ export default function AppLayout({ workspaceId, children }: AppLayoutProps) {
     { label: "Members",        icon: Users,           path: `${basePath}/members` },
     { label: "Integrations",   icon: Plug,            path: `${basePath}/integrations` },
     { label: "MCP",            icon: Zap,             path: `${basePath}/mcp` },
-    { label: "Scheduled Jobs", icon: Clock,           path: `${basePath}/scheduled-jobs` },
-    { label: "Pipelines",      icon: GitBranch,       path: `${basePath}/pipelines`,     badge: null },
-    { label: "Triggers",       icon: Webhook,         path: `${basePath}/triggers`,      badge: null },
-    { label: "Git Agents",     icon: GitPullRequest,  path: `${basePath}/git-agents`,    badge: null },
-    { label: "Git Repos",      icon: GitFork,         path: `${basePath}/git-repos`,     badge: null },
-    { label: "Approvals",      icon: ShieldAlert,     path: `${basePath}/approvals`,     badge: pendingApprovals > 0 ? pendingApprovals : null },
-    { label: "Observability",  icon: BarChart2,       path: `${basePath}/observability`, badge: null },
+    { label: "Scheduled Jobs",   icon: Clock,           path: `${basePath}/scheduled-jobs` },
+    { label: "Pipelines",        icon: GitBranch,       path: `${basePath}/pipelines`,        badge: null },
+    { label: "Triggers",         icon: Webhook,         path: `${basePath}/triggers`,         badge: null },
+    { label: "Agent Templates",  icon: LayoutTemplate,  path: `${basePath}/agent-templates`,  badge: null },
+    { label: "Job Queue",        icon: ListOrdered,     path: `${basePath}/job-queue`,        badge: null },
+    { label: "Git Agents",       icon: GitPullRequest,  path: `${basePath}/git-agents`,       badge: null },
+    { label: "Git Repos",        icon: GitFork,         path: `${basePath}/git-repos`,        badge: null },
+    { label: "Approvals",        icon: ShieldAlert,     path: `${basePath}/approvals`,        badge: pendingApprovals > 0 ? pendingApprovals : null },
+    { label: "Observability",    icon: BarChart2,       path: `${basePath}/observability`,    badge: null },
+    { label: "Prompt Library",   icon: BookOpen,        path: `${basePath}/prompt-library`,   badge: null },
+    { label: "Agent Memory",     icon: Brain,           path: `${basePath}/memory`,           badge: null },
+    { label: "Alert Rules",      icon: BellRing,        path: `${basePath}/alert-rules`,      badge: null },
   ];
 
   const NavItem = ({ label, icon: Icon, path, badge }: { label: string; icon: any; path: string; badge?: number | null }) => {

@@ -23,7 +23,9 @@ import { sanitizeToolArgs } from "../lib/mountAllowlist";
 import { issueTaskToken, revokeTaskToken, getAndClearProxiedUsage } from "../proxy/inference-proxy";
 import { generateEmbedding } from "../lib/embeddings";
 import { estimateTokenCost } from "./token-cost";
+import { resolveProviderKey } from "../lib/resolve-provider-key";
 import { loadCloudCredentials, buildToolList, buildSystemPrompt } from "./agent-helpers";
+import { dispatchNotification } from "./notifier";
 import type { ProviderMessage } from "../providers";
 import type { Orchestrator, Agent } from "@shared/schema";
 
@@ -146,7 +148,8 @@ export async function executeTaskInK3s(taskId: string): Promise<void> {
         messages.push({ role: "system", content: `Agent memory:\n${memStr}` });
       }
       try {
-        const queryEmb = await generateEmbedding(task.input);
+        const embApiKey = await resolveProviderKey(orchestrator.provider, orchestrator.workspaceId);
+        const queryEmb = await generateEmbedding(task.input, { provider: orchestrator.provider, apiKey: embApiKey, baseUrl: orchestrator.baseUrl });
         if (queryEmb) {
           const vecMems = await storage.retrieveVectorMemories(agent.id, orchestrator.workspaceId, queryEmb, 5);
           const relevant = vecMems.filter((m) => m.similarity >= 0.70);
@@ -275,7 +278,8 @@ export async function executeTaskInK3s(taskId: string): Promise<void> {
 
     if (agent?.memoryEnabled && agent) {
       await storage.setAgentMemory(agent.id, "last_task_output", output.slice(0, 500));
-      generateEmbedding(output.slice(0, 4000))
+      resolveProviderKey(orchestrator.provider, orchestrator.workspaceId)
+        .then((embKey) => generateEmbedding(output.slice(0, 4000), { provider: orchestrator.provider, apiKey: embKey, baseUrl: orchestrator.baseUrl }))
         .then((emb) => {
           if (emb) {
             storage.storeVectorMemory(agent.id, orchestrator.workspaceId, output, emb, "task_output", taskId).catch(() => {});
@@ -286,11 +290,30 @@ export async function executeTaskInK3s(taskId: string): Promise<void> {
 
     await storage.updateTask(taskId, { status: "completed", output, completedAt: new Date() });
     taskLogEmitter.emit(`task:${taskId}`, { type: "done", status: "completed" });
+    dispatchNotification(orchestrator.id, "task.completed", {
+      taskId,
+      agentId: agent?.id,
+      agentName: agent?.name,
+      status: "completed",
+      input: task.input.slice(0, 4000),
+      output,
+      summary: output.slice(0, 300),
+      completedAt: new Date().toISOString(),
+    }).catch(console.error);
   } catch (err: any) {
     const message = err?.message ?? String(err);
     await log("error", `Task failed in K3s sandbox: ${message}`);
     await storage.updateTask(taskId, { status: "failed", errorMessage: message, completedAt: new Date() });
     taskLogEmitter.emit(`task:${taskId}`, { type: "done", status: "failed" });
+    dispatchNotification(orchestrator.id, "task.failed", {
+      taskId,
+      agentId: agent?.id,
+      agentName: agent?.name,
+      status: "failed",
+      input: task.input.slice(0, 4000),
+      error: message,
+      completedAt: new Date().toISOString(),
+    }).catch(console.error);
   } finally {
     revokeTaskToken(taskId);
   }

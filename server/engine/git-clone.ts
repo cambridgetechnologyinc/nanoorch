@@ -15,7 +15,6 @@ import { mkdtemp, rm, readFile, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { join, extname } from "path";
 import { tmpdir } from "os";
-import { assertSafeUrl } from "../lib/ssrf-guard";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -90,13 +89,12 @@ export interface CloneResult {
 }
 
 /**
- * Shallow-clone a GitHub or GitLab repository at the default branch HEAD.
+ * Shallow-clone a GitHub or GitLab repository at the specified branch (and
+ * optionally check out a specific commit SHA).
  *
- * Security note: branch and sha parameters from the database (originally
- * user-supplied) are NOT passed to any git command arguments to eliminate
- * second-order command injection. The clone always checks out the default
- * branch at HEAD. The branch/sha values are accepted in the opts signature
- * for API compatibility but are intentionally unused in git invocations.
+ * Falls back gracefully: if the branch clone fails (e.g. detached HEAD /
+ * protected default branch) it retries without --branch; if the SHA
+ * checkout fails it leaves HEAD at the tip of the cloned branch.
  */
 export async function cloneRepo(opts: {
   provider: "github" | "gitlab";
@@ -106,22 +104,14 @@ export async function cloneRepo(opts: {
   branch?: string;
   sha?: string;
 }): Promise<CloneResult> {
-  const { provider, repoPath, repoUrl, token } = opts;
-  // branch and sha are intentionally not destructured — they must not reach git args.
-
-  // Validate repoPath before constructing the clone URL.
-  // repoPath comes from the database (originally user-supplied) — block path traversal and option injection.
-  if (!repoPath || !/^[A-Za-z0-9_.\-\/]+$/.test(repoPath) || repoPath.includes("..")) {
-    throw new Error(`[git-clone] Invalid repository path "${repoPath}": only alphanumeric chars, slashes, hyphens, underscores, and dots are allowed`);
-  }
+  const { provider, repoPath, repoUrl, token, branch, sha } = opts;
 
   let cloneUrl: string;
   if (provider === "github") {
     cloneUrl = `https://x-access-token:${token}@github.com/${repoPath}.git`;
   } else {
-    const baseUrl = repoUrl?.match(/^https:\/\/[^/]+/)?.[0] ?? "https://gitlab.com";
-    assertSafeUrl(baseUrl);
-    cloneUrl = `${baseUrl.replace(/^https:\/\//, `https://oauth2:${token}@`)}/${repoPath}.git`;
+    const baseUrl = repoUrl?.match(/^https?:\/\/[^/]+/)?.[0] ?? "https://gitlab.com";
+    cloneUrl = baseUrl.replace(/^(https?:\/\/)/, `$1oauth2:${token}@`) + `/${repoPath}.git`;
   }
 
   const dir = await mkdtemp(join(tmpdir(), "nanoorch-git-"));
@@ -130,9 +120,30 @@ export async function cloneRepo(opts: {
   };
 
   try {
-    // Always clone the default branch at HEAD.
-    // No branch or SHA is passed to git to eliminate command injection vectors.
-    await gitSpawn(["clone", "--depth=1", "--single-branch", cloneUrl, dir]);
+    if (branch) {
+      try {
+        await gitSpawn([
+          "clone", "--depth=1", `--branch=${branch}`,
+          "--single-branch", cloneUrl, dir,
+        ]);
+      } catch {
+        // Branch clone failed (e.g. branch name not found or detached HEAD).
+        // Remove partial clone and retry without --branch to get the default branch.
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await gitSpawn(["clone", "--depth=1", "--single-branch", cloneUrl, dir]);
+      }
+    } else {
+      await gitSpawn(["clone", "--depth=1", "--single-branch", cloneUrl, dir]);
+    }
+
+    if (sha) {
+      try {
+        await gitSpawn(["fetch", "--depth=1", "origin", sha], dir);
+        await gitSpawn(["checkout", sha], dir);
+      } catch {
+        // Shallow history may not allow arbitrary SHA fetch — stay at HEAD
+      }
+    }
   } catch (err) {
     await cleanup();
     throw err;
@@ -148,7 +159,7 @@ async function isBinaryFile(filePath: string): Promise<boolean> {
   try {
     const { createReadStream } = await import("fs");
     return new Promise((resolve) => {
-      const stream = createReadStream(filePath, { start: 0, end: 511 }); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename -- filePath is bounds-checked by tryReadFile() before calling isBinaryFile()
+      const stream = createReadStream(filePath, { start: 0, end: 511 });
       const chunks: Buffer[] = [];
       stream.on("data", (c) => chunks.push(c as Buffer));
       stream.on("end", () => {
@@ -163,16 +174,13 @@ async function isBinaryFile(filePath: string): Promise<boolean> {
 }
 
 async function tryReadFile(dir: string, relPath: string): Promise<string | null> {
-  const { resolve } = await import("path");
-  const resolvedDir = resolve(dir);
-  const abs = resolve(dir, relPath);
-  if (!abs.startsWith(resolvedDir + "/") && abs !== resolvedDir) return null;
-  if (!existsSync(abs)) return null; // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename -- abs is path.resolve(dir,relPath), bounds-checked above
+  const abs = join(dir, relPath);
+  if (!existsSync(abs)) return null;
   try {
-    const s = await stat(abs); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename
+    const s = await stat(abs);
     if (!s.isFile() || s.size > MAX_FILE_BYTES * 2) return null;
     if (await isBinaryFile(abs)) return null;
-    const content = await readFile(abs, "utf-8"); // nosemgrep: javascript.lang.security.audit.detect-non-literal-fs-filename
+    const content = await readFile(abs, "utf-8");
     if (content.length > MAX_FILE_BYTES) {
       return content.slice(0, MAX_FILE_BYTES) + "\n…(file truncated at 10 KB)";
     }

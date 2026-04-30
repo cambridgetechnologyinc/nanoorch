@@ -32,6 +32,13 @@ import GitAgentsPage from "@/pages/GitAgentsPage";
 import GitReposPage from "@/pages/GitReposPage";
 import PricingPage from "@/pages/PricingPage";
 import ProviderKeysPage from "@/pages/ProviderKeysPage";
+import AuditLogPage from "@/pages/AuditLogPage";
+import ArchitecturePage from "@/pages/ArchitecturePage";
+import AgentTemplatesPage from "@/pages/AgentTemplatesPage";
+import JobQueuePage from "@/pages/JobQueuePage";
+import PromptLibraryPage from "@/pages/PromptLibraryPage";
+import AgentMemoryPage from "@/pages/AgentMemoryPage";
+import AlertRulesPage from "@/pages/AlertRulesPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function AuthGuard({
@@ -94,6 +101,7 @@ function Router() {
       <Route path="/" component={RootRedirect} />
       <Route path="/login" component={LoginPage} />
       <Route path="/pricing" component={PricingPage} />
+      <Route path="/architecture" component={ArchitecturePage} />
 
       {/* Member routes */}
       <Route path="/member">
@@ -268,6 +276,51 @@ function Router() {
           </AuthGuard>
         )}
       </Route>
+      <Route path="/workspaces/:wid/agent-templates">
+        {(params) => (
+          <AuthGuard adminOnly workspaceId={params.wid}>
+            <AppLayout workspaceId={params.wid}>
+              <AgentTemplatesPage workspaceId={params.wid} />
+            </AppLayout>
+          </AuthGuard>
+        )}
+      </Route>
+      <Route path="/workspaces/:wid/job-queue">
+        {(params) => (
+          <AuthGuard adminOnly workspaceId={params.wid}>
+            <AppLayout workspaceId={params.wid}>
+              <JobQueuePage workspaceId={params.wid} />
+            </AppLayout>
+          </AuthGuard>
+        )}
+      </Route>
+      <Route path="/workspaces/:wid/prompt-library">
+        {(params) => (
+          <AuthGuard adminOnly workspaceId={params.wid}>
+            <AppLayout workspaceId={params.wid}>
+              <PromptLibraryPage workspaceId={params.wid} />
+            </AppLayout>
+          </AuthGuard>
+        )}
+      </Route>
+      <Route path="/workspaces/:wid/memory">
+        {(params) => (
+          <AuthGuard adminOnly workspaceId={params.wid}>
+            <AppLayout workspaceId={params.wid}>
+              <AgentMemoryPage workspaceId={params.wid} />
+            </AppLayout>
+          </AuthGuard>
+        )}
+      </Route>
+      <Route path="/workspaces/:wid/alert-rules">
+        {(params) => (
+          <AuthGuard adminOnly workspaceId={params.wid}>
+            <AppLayout workspaceId={params.wid}>
+              <AlertRulesPage workspaceId={params.wid} />
+            </AppLayout>
+          </AuthGuard>
+        )}
+      </Route>
 
       {/* Global super-admin-only routes */}
       <Route path="/admin/sso">
@@ -290,6 +343,14 @@ function Router() {
         <AuthGuard superAdminOnly>
           <AdminLayout>
             <ProviderKeysPage />
+          </AdminLayout>
+        </AuthGuard>
+      </Route>
+
+      <Route path="/admin/audit-log">
+        <AuthGuard superAdminOnly>
+          <AdminLayout>
+            <AuditLogPage />
           </AdminLayout>
         </AuthGuard>
       </Route>

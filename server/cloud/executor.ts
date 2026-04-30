@@ -1,6 +1,5 @@
 import { executeKubernetesTool, validateKubernetesCredentials, type KubernetesCredentials } from "./kubernetes";
 export type { KubernetesCredentials };
-import { assertSafeUrl } from "../lib/ssrf-guard";
 import { EC2Client, DescribeInstancesCommand } from "@aws-sdk/client-ec2";
 import { S3Client, ListBucketsCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
@@ -119,7 +118,6 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
       const { baseUrl, apiKey } = creds.credentials;
       if (!baseUrl) throw new Error("RAGFlow Base URL is required");
       if (!apiKey) throw new Error("RAGFlow API Key is required");
-      assertSafeUrl(baseUrl);
       const url = `${baseUrl.replace(/\/$/, "")}/api/v1/datasets?page=1&page_size=1`;
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
@@ -134,7 +132,6 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
       if (!baseUrl) throw new Error("Jira Base URL is required");
       if (!email) throw new Error("Jira email is required");
       if (!apiToken) throw new Error("Jira API token is required");
-      assertSafeUrl(baseUrl);
       const base = baseUrl.replace(/\/$/, "");
       const auth = Buffer.from(`${email}:${apiToken}`).toString("base64");
       const res = await fetch(`${base}/rest/api/3/myself`, {
@@ -157,7 +154,6 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
       const { baseUrl, token } = creds.credentials;
       if (!baseUrl) throw new Error("GitLab Base URL is required");
       if (!token) throw new Error("GitLab token is required");
-      assertSafeUrl(baseUrl);
       const base = baseUrl.replace(/\/$/, "");
       const res = await fetch(`${base}/api/v4/user`, {
         headers: { "PRIVATE-TOKEN": token, Accept: "application/json" },
@@ -169,9 +165,10 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
     if (creds.provider === "teams") {
       const { webhookUrl } = creds.credentials;
       if (!webhookUrl) throw new Error("Teams webhook URL is required");
-      assertSafeUrl(webhookUrl);
-      const isConnector = new URL(webhookUrl).hostname.endsWith(".webhook.office.com") ||
-        new URL(webhookUrl).hostname === "webhook.office.com";
+      if (!webhookUrl.startsWith("https://")) {
+        throw new Error("Teams webhook URL must start with https://");
+      }
+      const isConnector = webhookUrl.includes("webhook.office.com");
       const testBody = isConnector
         ? {
             "@type": "MessageCard",
@@ -236,7 +233,6 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
       if (!instanceUrl) throw new Error("ServiceNow Instance URL is required");
       if (!username) throw new Error("ServiceNow username is required");
       if (!password) throw new Error("ServiceNow password is required");
-      assertSafeUrl(instanceUrl);
       const base = instanceUrl.replace(/\/$/, "");
       const auth = Buffer.from(`${username}:${password}`).toString("base64");
       const res = await fetch(`${base}/api/now/table/sys_user?sysparm_query=user_name=${encodeURIComponent(username)}&sysparm_limit=1&sysparm_fields=user_name,name,email`, {
@@ -257,8 +253,22 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
         const res = await pool.query("SELECT version()");
         const version = (res.rows[0]?.version as string ?? "").split(" ").slice(0, 2).join(" ");
         return { ok: true, detail: `Connected — ${version}` };
+      } catch (pgErr: any) {
+        // pg wraps refused/unreachable connections in AggregateError whose .message is "".
+        // Unwrap to get the real ECONNREFUSED / timeout message.
+        const inner = pgErr?.errors?.[0];
+        const raw = inner?.message || pgErr?.message || String(pgErr);
+        const code = inner?.code ?? pgErr?.code ?? "";
+        if (code === "ECONNREFUSED" || raw.includes("ECONNREFUSED")) {
+          const host = (connectionString.match(/@([^:/]+)/) ?? [])[1] ?? "host";
+          throw new Error(
+            `Connection refused — could not reach ${host}. ` +
+            `In Docker Compose, use the service name (e.g. "postgres") not "localhost".`
+          );
+        }
+        throw new Error(raw || "PostgreSQL connection failed");
       } finally {
-        await pool.end();
+        await pool.end().catch(() => {});
       }
     }
     if (creds.provider === "kubernetes") {
@@ -266,7 +276,10 @@ export async function validateCredentials(creds: CloudCredentials): Promise<{ ok
     }
     return { ok: false, detail: "Unknown provider" };
   } catch (err: any) {
-    return { ok: false, detail: err?.message ?? String(err) };
+    // AggregateError (e.g. from pg pool) has an empty .message; unwrap the first inner error
+    const inner = err?.errors?.[0];
+    const detail = err?.message || inner?.message || String(err) || "Unknown error";
+    return { ok: false, detail };
   }
 }
 
@@ -459,7 +472,6 @@ function extractRAGFlowChunks(data: any): Array<{ content: string; score: number
 }
 
 async function executeRAGFlowTool(name: string, args: Record<string, string>, creds: RAGFlowCredentials): Promise<unknown> {
-  assertSafeUrl(creds.baseUrl);
   const base = creds.baseUrl.replace(/\/$/, "");
   const headers = { Authorization: `Bearer ${creds.apiKey}`, "Content-Type": "application/json" };
 
@@ -509,7 +521,6 @@ async function executeRAGFlowTool(name: string, args: Record<string, string>, cr
 }
 
 async function executeJiraTool(name: string, args: Record<string, string>, creds: JiraCredentials): Promise<unknown> {
-  assertSafeUrl(creds.baseUrl);
   const base = creds.baseUrl.replace(/\/$/, "");
   const auth = Buffer.from(`${creds.email}:${creds.apiToken}`).toString("base64");
   const headers = { Authorization: `Basic ${auth}`, Accept: "application/json", "Content-Type": "application/json" };
@@ -771,7 +782,6 @@ async function executeGitHubTool(name: string, args: Record<string, string>, cre
 }
 
 async function executeGitLabTool(name: string, args: Record<string, string>, creds: GitLabCredentials): Promise<unknown> {
-  assertSafeUrl(creds.baseUrl);
   const base = creds.baseUrl.replace(/\/$/, "");
   const headers = { "PRIVATE-TOKEN": creds.token, Accept: "application/json", "Content-Type": "application/json" };
 
@@ -855,11 +865,9 @@ async function executeGitLabTool(name: string, args: Record<string, string>, cre
 
 async function executeTeamsTool(name: string, args: Record<string, string>, creds: TeamsCredentials): Promise<unknown> {
   const { webhookUrl } = creds;
-  assertSafeUrl(webhookUrl);
 
   // Detect URL type: old Office 365 Connectors vs new Power Automate Workflows
-  const isConnector = new URL(webhookUrl).hostname.endsWith(".webhook.office.com") ||
-    new URL(webhookUrl).hostname === "webhook.office.com";
+  const isConnector = webhookUrl.includes("webhook.office.com");
 
   const buildAdaptiveCard = (bodyBlocks: object[]) => ({
     type: "message",
@@ -1019,7 +1027,6 @@ async function executeSlackTool(name: string, args: Record<string, string>, cred
 }
 
 async function executeGoogleChatTool(name: string, args: Record<string, string>, creds: GoogleChatCredentials): Promise<unknown> {
-  assertSafeUrl(creds.webhookUrl);
   const post = async (body: object) => {
     const res = await fetch(creds.webhookUrl, {
       method: "POST",
@@ -1062,7 +1069,6 @@ async function executeGoogleChatTool(name: string, args: Record<string, string>,
 }
 
 async function executeServiceNowTool(name: string, args: Record<string, string>, creds: ServiceNowCredentials): Promise<unknown> {
-  assertSafeUrl(creds.instanceUrl);
   const base = creds.instanceUrl.replace(/\/$/, "");
   const auth = Buffer.from(`${creds.username}:${creds.password}`).toString("base64");
   const headers = {
@@ -1252,6 +1258,43 @@ async function executePostgreSQLTool(name: string, args: Record<string, string>,
   };
 
   try {
+    if (name === "pg_list_databases") {
+      const res = await pool.query(
+        `SELECT datname AS database,
+                pg_size_pretty(pg_database_size(datname)) AS size,
+                pg_encoding_to_char(encoding) AS encoding,
+                datcollate AS collation
+         FROM pg_database
+         WHERE datistemplate = false
+         ORDER BY datname`
+      );
+      return { databases: res.rows };
+    }
+
+    if (name === "pg_create_database") {
+      const dbName = safeId(args.database, "database");
+      // CREATE DATABASE cannot run inside a transaction; pool.query() uses autocommit by default.
+      const parts: string[] = [`CREATE DATABASE "${dbName}"`];
+      const withClauses: string[] = [];
+      if (args.owner)      withClauses.push(`OWNER = "${safeId(args.owner, "owner")}"`);
+      if (args.template)   withClauses.push(`TEMPLATE = "${safeId(args.template, "template")}"`);
+      if (args.encoding)   withClauses.push(`ENCODING = '${args.encoding.replace(/'/g, "''")}'`);
+      if (args.lc_collate) withClauses.push(`LC_COLLATE = '${args.lc_collate.replace(/'/g, "''")}'`);
+      if (args.lc_ctype)   withClauses.push(`LC_CTYPE = '${args.lc_ctype.replace(/'/g, "''")}'`);
+      if (withClauses.length > 0) parts.push(`WITH ${withClauses.join(" ")}`);
+      await pool.query(parts.join(" "));
+      return { database: dbName, created: true, message: `Database "${dbName}" created successfully.` };
+    }
+
+    if (name === "pg_drop_database") {
+      const dbName = safeId(args.database, "database");
+      const force = args.force === "true";
+      // DROP DATABASE cannot run inside a transaction; pool.query() uses autocommit by default.
+      const forceClause = force ? " WITH (FORCE)" : "";
+      await pool.query(`DROP DATABASE "${dbName}"${forceClause}`);
+      return { database: dbName, dropped: true, message: `Database "${dbName}" dropped successfully.` };
+    }
+
     // ── Original 5 tools ────────────────────────────────────────────────────
 
     if (name === "pg_list_schemas") {
@@ -2065,7 +2108,6 @@ export async function retrieveRAGFlowContext(
   question: string,
   creds: RAGFlowCredentials,
 ): Promise<Array<{ content: string; documentName: string; score: number }>> {
-  assertSafeUrl(creds.baseUrl);
   const base = creds.baseUrl.replace(/\/$/, "");
   const headers = { Authorization: `Bearer ${creds.apiKey}`, "Content-Type": "application/json" };
 

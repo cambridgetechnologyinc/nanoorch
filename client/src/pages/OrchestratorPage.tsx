@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Link } from "wouter";
-import { Plus, Bot, Radio, ListTodo, Settings, Play, Pause, Trash2 } from "lucide-react";
+import { Plus, Bot, Radio, ListTodo, Settings, Play, Pause, Trash2, Sparkles, Loader2, Undo2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -156,6 +156,7 @@ export default function OrchestratorPage({ workspaceId, orchestratorId }: Props)
           onSubmit={() => createMutation.mutate(form)}
           isPending={createMutation.isPending}
           title="Create Orchestrator"
+          workspaceId={workspaceId}
         />
       </div>
     );
@@ -229,6 +230,7 @@ export default function OrchestratorPage({ workspaceId, orchestratorId }: Props)
         onSubmit={() => updateMutation.mutate(form)}
         isPending={updateMutation.isPending}
         title="Edit Orchestrator"
+        workspaceId={workspaceId}
       />
     </div>
   );
@@ -252,7 +254,7 @@ function NavCard({ href, icon: Icon, title, description }: { href: string; icon:
   );
 }
 
-function OrchestratorFormDialog({ open, onOpenChange, form, setForm, onSubmit, isPending, title }: {
+function OrchestratorFormDialog({ open, onOpenChange, form, setForm, onSubmit, isPending, title, workspaceId }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   form: OrchestratorForm;
@@ -260,7 +262,25 @@ function OrchestratorFormDialog({ open, onOpenChange, form, setForm, onSubmit, i
   onSubmit: () => void;
   isPending: boolean;
   title: string;
+  workspaceId: string;
 }) {
+  const { toast } = useToast();
+  const [prevSystemPrompt, setPrevSystemPrompt] = useState<string | null>(null);
+
+  const rewritePromptMutation = useMutation({
+    mutationFn: async (text: string) => {
+      const res = await apiRequest("POST", `/api/workspaces/${workspaceId}/prompt-rewrite`, { text, role: "orchestrator" });
+      return res.json();
+    },
+    onSuccess: (data: any) => {
+      const original = form.systemPrompt;
+      setForm({ ...form, systemPrompt: data.rewritten });
+      setPrevSystemPrompt(original);
+      toast({ title: "Prompt rewritten", description: "AI improved your system prompt." });
+    },
+    onError: (err: any) => toast({ title: "Rewrite failed", description: err.message, variant: "destructive" }),
+  });
+
   const currentModels = PROVIDERS.find((p) => p.id === form.provider)?.models ?? [];
 
   return (
@@ -371,9 +391,33 @@ function OrchestratorFormDialog({ open, onOpenChange, form, setForm, onSubmit, i
           )}
 
           <div>
-            <Label>System Prompt</Label>
-            <Textarea value={form.systemPrompt} onChange={(e) => setForm({ ...form, systemPrompt: e.target.value })}
-              placeholder="You are a helpful AI orchestrator..." className="mt-1 font-mono text-sm" rows={4}
+            <div className="flex items-center justify-between mb-1">
+              <Label>System Prompt</Label>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-xs gap-1 text-muted-foreground hover:text-primary"
+                disabled={rewritePromptMutation.isPending || (!prevSystemPrompt && !form.systemPrompt.trim())}
+                onClick={() => {
+                  if (prevSystemPrompt !== null) {
+                    setForm({ ...form, systemPrompt: prevSystemPrompt });
+                    setPrevSystemPrompt(null);
+                  } else {
+                    rewritePromptMutation.mutate(form.systemPrompt);
+                  }
+                }}
+                data-testid="button-rewrite-system-prompt"
+              >
+                {rewritePromptMutation.isPending
+                  ? <><Loader2 className="w-3 h-3 animate-spin" /> Rewriting…</>
+                  : prevSystemPrompt
+                    ? <><Undo2 className="w-3 h-3" /> Undo</>
+                    : <><Sparkles className="w-3 h-3" /> Rewrite</>}
+              </Button>
+            </div>
+            <Textarea value={form.systemPrompt} onChange={(e) => { setForm({ ...form, systemPrompt: e.target.value }); setPrevSystemPrompt(null); }}
+              placeholder="You are a helpful AI orchestrator..." className="font-mono text-sm" rows={4}
               data-testid="input-system-prompt" />
           </div>
 

@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Link, useLocation } from "wouter";
 import {
   Paintbrush, KeyRound, Shield, ChevronLeft,
-  Moon, Sun, Zap, LogOut, PanelLeftClose, PanelLeftOpen,
+  Moon, Sun, Zap, LogOut, PanelLeftClose, PanelLeftOpen, ClipboardList,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useTheme } from "./ThemeProvider";
@@ -20,9 +20,10 @@ import {
 const STORAGE_KEY = "nanoorch-admin-sidebar-collapsed";
 
 const NAV_ITEMS = [
-  { label: "Branding",      icon: Paintbrush, path: "/admin/branding" },
-  { label: "Provider Keys", icon: KeyRound,   path: "/admin/provider-keys" },
-  { label: "SSO",           icon: Shield,     path: "/admin/sso" },
+  { label: "Branding",      icon: Paintbrush,    path: "/admin/branding" },
+  { label: "Provider Keys", icon: KeyRound,      path: "/admin/provider-keys" },
+  { label: "SSO",           icon: Shield,        path: "/admin/sso" },
+  { label: "Audit Log",     icon: ClipboardList, path: "/admin/audit-log" },
 ];
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {

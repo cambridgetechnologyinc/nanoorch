@@ -4,7 +4,7 @@ import { Link } from "wouter";
 import {
   ArrowLeft, CheckCircle, XCircle, Clock, Loader2, Terminal,
   ChevronDown, ChevronRight, Wrench, Brain, Info, AlertTriangle, Zap,
-  GitBranch,
+  GitBranch, Network, ChevronUp, X, Cpu, Layers,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -175,7 +175,7 @@ function LiveFeed({ taskId, onDone }: { taskId: string; onDone: () => void }) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const es = new EventSource(`/api/tasks/${taskId}/stream`);
+    const es = new EventSource(`/api/tasks/${taskId}/stream`, { withCredentials: true });
 
     es.onmessage = (e) => {
       try {
@@ -444,10 +444,240 @@ function TraceGraph({ taskId }: { taskId: string }) {
   );
 }
 
+// ── Span Graph (Phase 3) ──────────────────────────────────────────────────────
+
+interface Span {
+  id: string;
+  taskId: string;
+  parentSpanId: string | null;
+  spanType: string;
+  name: string;
+  input: Record<string, unknown> | null;
+  output: Record<string, unknown> | null;
+  metadata: Record<string, unknown> | null;
+  status: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  durationMs: number | null;
+  seq: number;
+}
+
+const SPAN_STYLES: Record<string, { bg: string; border: string; text: string; icon: any; label: string }> = {
+  root:     { bg: "bg-primary/10",     border: "border-primary/40",     text: "text-primary",     icon: Layers, label: "Root" },
+  llm_call: { bg: "bg-blue-500/10",    border: "border-blue-500/40",    text: "text-blue-400",    icon: Cpu, label: "LLM Call" },
+  tool_call:{ bg: "bg-orange-500/10",  border: "border-orange-500/40",  text: "text-orange-400",  icon: Wrench, label: "Tool" },
+  info:     { bg: "bg-muted",          border: "border-border",         text: "text-muted-foreground", icon: Info, label: "Info" },
+};
+
+function SpanNode({ span, indent = 0, onClick, isSelected }: {
+  span: Span; indent?: number; onClick: (s: Span) => void; isSelected: boolean;
+}) {
+  const style = SPAN_STYLES[span.spanType] ?? SPAN_STYLES.info;
+  const Icon = style.icon;
+  const isRunning = span.status === "running";
+  const isError = span.status === "error";
+
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-2 p-2.5 rounded-lg border cursor-pointer transition-all hover:shadow-sm",
+        style.bg, style.border,
+        isSelected && "ring-2 ring-primary/60",
+        indent > 0 && "ml-8",
+      )}
+      style={{ marginLeft: indent * 32 }}
+      onClick={() => onClick(span)}
+      data-testid={`span-node-${span.id}`}
+    >
+      <div className={cn("shrink-0", style.text)}>
+        {isRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> :
+         isError ? <XCircle className="w-3.5 h-3.5 text-red-400" /> :
+         <Icon className="w-3.5 h-3.5" />}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className={cn("text-[10px] font-semibold uppercase tracking-wide shrink-0", style.text)}>
+            {style.label}
+          </span>
+          <span className="text-xs text-foreground font-medium truncate">{span.name}</span>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        {isError && <Badge variant="outline" className="text-[9px] border-red-500/40 text-red-400 bg-red-500/5">Error</Badge>}
+        {span.durationMs != null && (
+          <span className="text-[10px] text-muted-foreground font-mono">
+            {span.durationMs < 1000 ? `${span.durationMs}ms` : `${(span.durationMs / 1000).toFixed(1)}s`}
+          </span>
+        )}
+        {isRunning && (
+          <Badge variant="outline" className="text-[9px] border-blue-500/40 text-blue-400 bg-blue-500/5 animate-pulse">live</Badge>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpanDetailPanel({ span, onClose }: { span: Span; onClose: () => void }) {
+  const style = SPAN_STYLES[span.spanType] ?? SPAN_STYLES.info;
+  return (
+    <div className="border-t border-border bg-muted/20 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className={cn("text-xs font-semibold", style.text)}>{style.label}</span>
+          <span className="text-sm font-medium">{span.name}</span>
+          {span.durationMs != null && (
+            <span className="text-xs text-muted-foreground font-mono">
+              ({span.durationMs < 1000 ? `${span.durationMs}ms` : `${(span.durationMs / 1000).toFixed(1)}s`})
+            </span>
+          )}
+        </div>
+        <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onClose}>
+          <X className="w-3.5 h-3.5" />
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        {span.input && (
+          <div>
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">Input</div>
+            <pre className="text-xs bg-muted/50 rounded p-2 overflow-auto max-h-40 whitespace-pre-wrap font-mono">
+              {JSON.stringify(span.input, null, 2)}
+            </pre>
+          </div>
+        )}
+        {span.output && (
+          <div>
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">Output</div>
+            <pre className="text-xs bg-muted/50 rounded p-2 overflow-auto max-h-40 whitespace-pre-wrap font-mono">
+              {JSON.stringify(span.output, null, 2)}
+            </pre>
+          </div>
+        )}
+      </div>
+      {span.metadata && Object.keys(span.metadata).length > 0 && (
+        <div className="mt-3">
+          <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-1">Metadata</div>
+          <div className="flex flex-wrap gap-1.5">
+            {Object.entries(span.metadata).map(([k, v]) => (
+              <span key={k} className="text-[10px] font-mono bg-muted/50 rounded px-2 py-0.5">
+                {k}: <span className="text-foreground">{String(v)}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SpanGraph({ taskId }: { taskId: string }) {
+  const [selectedSpan, setSelectedSpan] = useState<Span | null>(null);
+  const { data: spans = [], isLoading } = useQuery<Span[]>({
+    queryKey: [`/api/tasks/${taskId}/spans`],
+    refetchInterval: (q) => {
+      const hasRunning = (q.state.data ?? []).some((s) => s.status === "running");
+      return hasRunning ? 2500 : false;
+    },
+  });
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-muted-foreground p-6">
+        <Loader2 className="w-3 h-3 animate-spin" /> Loading span graph…
+      </div>
+    );
+  }
+
+  if (spans.length === 0) {
+    return (
+      <div className="text-center py-12 px-4">
+        <Network className="w-8 h-8 text-muted-foreground/40 mx-auto mb-2" />
+        <div className="text-sm text-muted-foreground">No trace spans available</div>
+        <div className="text-xs text-muted-foreground/60 mt-1">Spans are captured for tasks run after enabling trace instrumentation</div>
+      </div>
+    );
+  }
+
+  const sorted = [...spans].sort((a, b) => a.seq - b.seq);
+  const root = sorted.find((s) => s.spanType === "root");
+  const rest = sorted.filter((s) => s.spanType !== "root");
+
+  const rounds: Array<{ llm: Span | null; tools: Span[] }> = [];
+  let currentRound: { llm: Span | null; tools: Span[] } = { llm: null, tools: [] };
+  for (const span of rest) {
+    if (span.spanType === "llm_call") {
+      if (currentRound.llm || currentRound.tools.length > 0) rounds.push(currentRound);
+      currentRound = { llm: span, tools: [] };
+    } else {
+      currentRound.tools.push(span);
+    }
+  }
+  if (currentRound.llm || currentRound.tools.length > 0) rounds.push(currentRound);
+
+  const totalDurationMs = root?.durationMs ?? null;
+
+  return (
+    <div>
+      <ScrollArea className="h-[460px]">
+        <div className="p-4 space-y-2">
+          {/* Stats row */}
+          <div className="flex items-center gap-4 text-xs text-muted-foreground mb-4 pb-3 border-b border-border">
+            <span>{spans.length} span{spans.length !== 1 ? "s" : ""}</span>
+            <span>{rounds.length} LLM round{rounds.length !== 1 ? "s" : ""}</span>
+            <span>{rest.filter((s) => s.spanType === "tool_call").length} tool call{rest.filter((s) => s.spanType === "tool_call").length !== 1 ? "s" : ""}</span>
+            {totalDurationMs != null && (
+              <span className="ml-auto font-mono">
+                Total: {totalDurationMs < 1000 ? `${totalDurationMs}ms` : `${(totalDurationMs / 1000).toFixed(2)}s`}
+              </span>
+            )}
+          </div>
+
+          {/* Root span */}
+          {root && (
+            <SpanNode
+              span={root}
+              indent={0}
+              onClick={(s) => setSelectedSpan(s === selectedSpan ? null : s)}
+              isSelected={selectedSpan?.id === root.id}
+            />
+          )}
+
+          {/* Rounds */}
+          {rounds.map((round, ri) => (
+            <div key={ri} className="space-y-1 pl-4 border-l-2 border-border ml-3">
+              {round.llm && (
+                <SpanNode
+                  span={round.llm}
+                  indent={0}
+                  onClick={(s) => setSelectedSpan(s === selectedSpan ? null : s)}
+                  isSelected={selectedSpan?.id === round.llm!.id}
+                />
+              )}
+              {round.tools.map((tool) => (
+                <SpanNode
+                  key={tool.id}
+                  span={tool}
+                  indent={1}
+                  onClick={(s) => setSelectedSpan(selectedSpan?.id === s.id ? null : s)}
+                  isSelected={selectedSpan?.id === tool.id}
+                />
+              ))}
+            </div>
+          ))}
+        </div>
+      </ScrollArea>
+
+      {/* Detail panel */}
+      {selectedSpan && (
+        <SpanDetailPanel span={selectedSpan} onClose={() => setSelectedSpan(null)} />
+      )}
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function TaskDetailPage({ taskId, workspaceId, orchestratorId }: Props) {
-  const [activeTab, setActiveTab] = useState<"feed" | "trace">("feed");
+  const [activeTab, setActiveTab] = useState<"feed" | "trace" | "graph">("feed");
 
   const { data: task, refetch: refetchTask } = useQuery<Task>({
     queryKey: [`/api/tasks/${taskId}`],
@@ -536,44 +766,38 @@ export default function TaskDetailPage({ taskId, workspaceId, orchestratorId }: 
         <CardHeader className="pb-0">
           <div className="flex items-center justify-between">
             <div className="flex gap-1">
-              <button
-                onClick={() => setActiveTab("feed")}
-                data-testid="tab-live-feed"
-                className={cn(
-                  "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors",
-                  activeTab === "feed"
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
-                )}
-              >
-                <Terminal className="w-3.5 h-3.5" />
-                Live Feed
-              </button>
-              <button
-                onClick={() => setActiveTab("trace")}
-                data-testid="tab-trace"
-                className={cn(
-                  "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors",
-                  activeTab === "trace"
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
-                )}
-              >
-                <GitBranch className="w-3.5 h-3.5" />
-                Trace
-              </button>
+              {(["feed", "trace", "graph"] as const).map((tab) => {
+                const cfg = {
+                  feed:  { icon: Terminal,   label: "Live Feed" },
+                  trace: { icon: GitBranch,  label: "Trace" },
+                  graph: { icon: Network,    label: "Span Graph" },
+                }[tab];
+                return (
+                  <button
+                    key={tab}
+                    onClick={() => setActiveTab(tab)}
+                    data-testid={`tab-${tab}`}
+                    className={cn(
+                      "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors",
+                      activeTab === tab
+                        ? "bg-muted text-foreground"
+                        : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    )}
+                  >
+                    <cfg.icon className="w-3.5 h-3.5" />
+                    {cfg.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
           <div className="border-b border-border mt-2" />
         </CardHeader>
 
         <CardContent className="p-0">
-          {activeTab === "feed" && (
-            <LiveFeed taskId={taskId} onDone={() => refetchTask()} />
-          )}
-          {activeTab === "trace" && (
-            <TraceGraph taskId={taskId} />
-          )}
+          {activeTab === "feed"  && <LiveFeed taskId={taskId} onDone={() => refetchTask()} />}
+          {activeTab === "trace" && <TraceGraph taskId={taskId} />}
+          {activeTab === "graph" && <SpanGraph taskId={taskId} />}
         </CardContent>
       </Card>
     </div>

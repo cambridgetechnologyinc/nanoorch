@@ -3,18 +3,11 @@
  *
  * Posts git agent findings back to GitHub/GitLab as PR/commit comments.
  * Called by git-agent-engine after each task completes.
- *
- * Security note: outbound HTTP feedback posting has been permanently disabled
- * to eliminate the CodeQL SSRF attack surface (CWE-918). User-controlled values
- * (repo path, commit SHA, PR number) were flowing into the URL argument of
- * fetch(), which CodeQL correctly identifies as a potential SSRF vector.
- * Feedback is logged locally instead; no outbound requests are made.
  */
 
 import type { GitRepo } from "@shared/schema";
+import { decrypt } from "../lib/encryption";
 import type { GitWebhookEvent } from "./git-agent-engine";
-
-const MAX_COMMENT_LENGTH = 50_000;
 
 /** Inline copy — avoids circular import with git-agent-engine. */
 function normalizeEventType(event: GitWebhookEvent): string {
@@ -33,6 +26,9 @@ function normalizeEventType(event: GitWebhookEvent): string {
   }
   return event.eventType;
 }
+
+const MAX_COMMENT_LENGTH = 50_000;
+const USER_AGENT = "NanoOrch/1.0";
 
 function truncateOutput(text: string): string {
   if (text.length <= MAX_COMMENT_LENGTH) return text;
@@ -63,14 +59,85 @@ function formatMarkdownComment(agentName: string, output: string, event: GitWebh
   return lines.join("\n");
 }
 
+async function postJsonWithRetry(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, string>,
+): Promise<void> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const text = (await res.text()).slice(0, 300);
+    throw new Error(`HTTP ${res.status}: ${text}`);
+  }
+}
+
+async function postGitHubComment(
+  token: string,
+  repoPath: string,
+  event: GitWebhookEvent,
+  commentBody: string,
+): Promise<void> {
+  const normalized = normalizeEventType(event);
+  const headers = {
+    "Authorization": `Bearer ${token}`,
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": USER_AGENT,
+  };
+
+  if (normalized === "merge_request" && event.prNumber) {
+    // PR comment
+    const url = `https://api.github.com/repos/${repoPath}/issues/${event.prNumber}/comments`;
+    await postJsonWithRetry(url, headers, { body: commentBody });
+    return;
+  }
+
+  // Commit comment (push or fallback)
+  const sha = event.commitSha;
+  if (!sha) {
+    console.warn("[git-feedback] GitHub: no SHA to comment on — skipping");
+    return;
+  }
+  const url = `https://api.github.com/repos/${repoPath}/commits/${sha}/comments`;
+  await postJsonWithRetry(url, headers, { body: commentBody });
+}
+
+async function postGitLabComment(
+  token: string,
+  baseUrl: string,
+  repoPath: string,
+  event: GitWebhookEvent,
+  commentBody: string,
+): Promise<void> {
+  const normalized = normalizeEventType(event);
+  const encodedPath = encodeURIComponent(repoPath);
+  const headers = { "PRIVATE-TOKEN": token, "User-Agent": USER_AGENT };
+
+  if (normalized === "merge_request" && event.prNumber) {
+    // MR note
+    const url = `${baseUrl}/api/v4/projects/${encodedPath}/merge_requests/${event.prNumber}/notes`;
+    await postJsonWithRetry(url, headers, { body: commentBody });
+    return;
+  }
+
+  // Commit comment
+  const sha = event.commitSha;
+  if (!sha) {
+    console.warn("[git-feedback] GitLab: no SHA to comment on — skipping");
+    return;
+  }
+  const url = `${baseUrl}/api/v4/projects/${encodedPath}/repository/commits/${sha}/comments`;
+  await postJsonWithRetry(url, headers, { note: commentBody });
+}
+
 /**
  * Post agent findings back to GitHub/GitLab as a PR or commit comment.
- *
- * SECURITY: Outbound HTTP posting is disabled. All user-controlled values
- * (repoPath, commitSha, prNumber) previously flowed into the URL argument of
- * fetch(), creating a CodeQL SSRF finding. The comment body is now only written
- * to the local server log. Re-enable external posting only after introducing a
- * strict server-side URL allowlist enforced outside of TypeScript taint flow.
+ * Safe to call — all errors are caught and logged, never thrown.
  */
 export async function postGitFeedback(opts: {
   repo: GitRepo;
@@ -85,12 +152,28 @@ export async function postGitFeedback(opts: {
     return;
   }
 
-  const commentBody = formatMarkdownComment(agentName, taskOutput, event);
+  let token: string;
+  try {
+    token = decrypt(repo.tokenEncrypted);
+  } catch (err) {
+    console.warn("[git-feedback] Could not decrypt token — skipping feedback");
+    return;
+  }
 
-  // Outbound HTTP posting disabled — log locally only (SSRF mitigation).
-  console.log(
-    `[git-feedback] Feedback suppressed (SSRF guard active) for ${repo.provider}` +
-    ` repo ${repo.repoPath ?? "(unknown)"} — agent: ${agentName}\n` +
-    commentBody.slice(0, 500),
-  );
+  const commentBody = formatMarkdownComment(agentName, taskOutput, event);
+  const repoPath = repo.repoPath ?? "";
+
+  try {
+    if (repo.provider === "github") {
+      await postGitHubComment(token, repoPath, event, commentBody);
+      console.log(`[git-feedback] GitHub comment posted for ${repoPath}`);
+    } else if (repo.provider === "gitlab") {
+      const baseUrl = repo.repoUrl?.match(/^https?:\/\/[^/]+/)?.[0] ?? "https://gitlab.com";
+      await postGitLabComment(token, baseUrl, repoPath, event, commentBody);
+      console.log(`[git-feedback] GitLab comment posted for ${repoPath}`);
+    }
+  } catch (err: any) {
+    // Never let feedback failure propagate — it's best-effort
+    console.warn(`[git-feedback] Failed to post comment for ${repoPath}: ${err?.message ?? err}`);
+  }
 }

@@ -20,7 +20,7 @@ export default function MemberChatPage({ slug }: MemberChatPageProps) {
   const { data: workspace, isLoading, isError } = useQuery<Workspace>({
     queryKey: ["/api/workspaces/by-slug", slug],
     queryFn: async () => {
-      const res = await fetch(`/api/workspaces/by-slug/${slug}`);
+      const res = await fetch(`/api/workspaces/by-slug/${slug}`, { credentials: "include" });
       if (!res.ok) throw new Error("Not found");
       return res.json();
     },

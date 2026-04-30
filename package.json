@@ -23,7 +23,6 @@
     "@azure/identity": "^4.13.0",
     "@google-cloud/storage": "^7.19.0",
     "@google/genai": "^1.44.0",
-    "@hono/node-server": "^1.19.13",
     "@hookform/resolvers": "^3.10.0",
     "@jridgewell/trace-mapping": "^0.3.25",
     "@modelcontextprotocol/sdk": "^1.27.1",
@@ -60,9 +59,7 @@
     "@types/dockerode": "^4.0.1",
     "@types/memoizee": "^0.4.12",
     "@types/node-cron": "^3.0.11",
-    "@xmldom/xmldom": "^0.8.13",
-    "basic-ftp": "^5.3.0",
-    "brace-expansion": "^2.0.3",
+    "bytenode": "^1.5.7",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
@@ -72,19 +69,16 @@
     "date-fns": "^3.6.0",
     "dockerode": "^4.0.9",
     "docx": "^9.6.1",
-    "drizzle-orm": "^0.45.2",
+    "drizzle-orm": "^0.39.3",
     "drizzle-zod": "^0.7.0",
     "embla-carousel-react": "^8.6.0",
     "express": "^5.0.1",
     "express-rate-limit": "^8.3.1",
     "express-session": "^1.18.1",
-    "fast-xml-parser": "^5.7.0",
     "framer-motion": "^11.13.1",
     "googleapis": "^171.4.0",
-    "hono": "^4.12.14",
     "input-otp": "^1.4.2",
     "ioredis": "^5.10.1",
-    "lodash": "^4.17.21",
     "lucide-react": "^0.453.0",
     "memoizee": "^0.4.17",
     "memorystore": "^1.6.7",
@@ -96,13 +90,10 @@
     "p-retry": "^7.1.1",
     "passport": "^0.7.0",
     "passport-local": "^1.0.0",
-    "path-to-regexp": "^8.4.0",
     "pdfkit": "^0.18.0",
     "pg": "^8.16.3",
-    "picomatch": "^2.3.2",
     "pngjs": "^7.0.0",
     "pptxgenjs": "^4.0.1",
-    "protobufjs": "^7.5.5",
     "puppeteer": "^24.40.0",
     "react": "^18.3.1",
     "react-day-picker": "^8.10.1",
@@ -118,7 +109,6 @@
     "vaul": "^1.1.2",
     "wouter": "^3.3.5",
     "ws": "^8.18.0",
-    "yaml": "^2.8.3",
     "zod": "^3.24.2",
     "zod-validation-error": "^3.4.0"
   },
@@ -145,15 +135,12 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.20.5",
     "typescript": "5.6.3",
-    "vite": "^7.3.2"
+    "vite": "^7.3.0"
   },
   "overrides": {
     "drizzle-kit": {
       "@esbuild-kit/esm-loader": "npm:tsx@^4.20.4"
-    },
-    "@tootallnate/once": "3.0.1",
-    "uuid": "^14.0.0",
-    "fast-xml-parser": "^5.7.0"
+    }
   },
   "optionalDependencies": {
     "bufferutil": "^4.0.8"

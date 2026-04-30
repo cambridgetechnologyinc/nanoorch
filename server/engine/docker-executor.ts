@@ -13,7 +13,9 @@ import { executeCodeInSandbox } from "./sandbox-executor";
 import { issueTaskToken, revokeTaskToken, getAndClearProxiedUsage } from "../proxy/inference-proxy";
 import { generateEmbedding } from "../lib/embeddings";
 import { estimateTokenCost } from "./token-cost";
+import { resolveProviderKey } from "../lib/resolve-provider-key";
 import { getRepoWorkspace } from "./git-clone";
+import { dispatchNotification } from "./notifier";
 
 const MAX_TOOL_ROUNDS = 10;
 const CONTAINER_TIMEOUT_MS = 180_000;
@@ -89,7 +91,8 @@ export async function executeTaskInDocker(taskId: string): Promise<void> {
         messages.push({ role: "system", content: `Agent memory:\n${memStr}` });
       }
       try {
-        const queryEmb = await generateEmbedding(task.input);
+        const embApiKey = await resolveProviderKey(orchestrator.provider, orchestrator.workspaceId);
+        const queryEmb = await generateEmbedding(task.input, { provider: orchestrator.provider, apiKey: embApiKey, baseUrl: orchestrator.baseUrl });
         if (queryEmb) {
           const vecMems = await storage.retrieveVectorMemories(agent.id, orchestrator.workspaceId, queryEmb, 5);
           const relevant = vecMems.filter((m) => m.similarity >= 0.70);
@@ -230,7 +233,8 @@ export async function executeTaskInDocker(taskId: string): Promise<void> {
 
     if (agent?.memoryEnabled && agent) {
       await storage.setAgentMemory(agent.id, "last_task_output", output.slice(0, 500));
-      generateEmbedding(output.slice(0, 4000))
+      resolveProviderKey(orchestrator.provider, orchestrator.workspaceId)
+        .then((embKey) => generateEmbedding(output.slice(0, 4000), { provider: orchestrator.provider, apiKey: embKey, baseUrl: orchestrator.baseUrl }))
         .then((emb) => {
           if (emb) {
             storage.storeVectorMemory(agent.id, orchestrator.workspaceId, output, emb, "task_output", taskId).catch(() => {});
@@ -245,6 +249,16 @@ export async function executeTaskInDocker(taskId: string): Promise<void> {
       completedAt: new Date(),
     });
     taskLogEmitter.emit(`task:${taskId}`, { type: "done", status: "completed" });
+    dispatchNotification(orchestrator.id, "task.completed", {
+      taskId,
+      agentId: agent?.id,
+      agentName: agent?.name,
+      status: "completed",
+      input: task.input.slice(0, 4000),
+      output,
+      summary: output.slice(0, 300),
+      completedAt: new Date().toISOString(),
+    }).catch(console.error);
   } catch (err: any) {
     const message = err?.message ?? String(err);
     // "Connection error." is the OpenAI SDK's APIConnectionError — the agent
@@ -265,6 +279,15 @@ export async function executeTaskInDocker(taskId: string): Promise<void> {
       completedAt: new Date(),
     });
     taskLogEmitter.emit(`task:${taskId}`, { type: "done", status: "failed" });
+    dispatchNotification(orchestrator.id, "task.failed", {
+      taskId,
+      agentId: agent?.id,
+      agentName: agent?.name,
+      status: "failed",
+      input: task.input.slice(0, 4000),
+      error: message,
+      completedAt: new Date().toISOString(),
+    }).catch(console.error);
   } finally {
     // Always revoke the proxy token — containers can no longer call AI APIs
     // after the task finishes, regardless of how it ended.

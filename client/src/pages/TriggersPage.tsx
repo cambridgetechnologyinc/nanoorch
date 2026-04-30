@@ -17,25 +17,48 @@ import type { EventTrigger, TriggerEvent, Orchestrator, Agent } from "@shared/sc
 import PaginationControls from "@/components/PaginationControls";
 
 const SOURCE_LABELS: Record<string, string> = {
-  github: "GitHub",
-  gitlab: "GitLab",
-  jira: "Jira",
+  github:    "GitHub",
+  gitlab:    "GitLab",
+  jira:      "Jira",
+  linear:    "Linear",
+  pagerduty: "PagerDuty",
+  stripe:    "Stripe",
+  datadog:   "Datadog",
+  sentry:    "Sentry",
+  generic:   "Generic / Custom Webhook",
 };
 
-const GITHUB_EVENTS = ["push", "pull_request", "issues", "issue_comment", "release", "workflow_run", "check_run", "deployment"];
-const GITLAB_EVENTS = ["push", "merge_request", "issue", "note", "pipeline", "deployment", "release"];
-const JIRA_EVENTS = ["jira:issue_created", "jira:issue_updated", "jira:issue_deleted", "jira:worklog_updated"];
+const GITHUB_EVENTS    = ["push", "pull_request", "issues", "issue_comment", "release", "workflow_run", "check_run", "deployment"];
+const GITLAB_EVENTS    = ["push", "merge_request", "issue", "note", "pipeline", "deployment", "release"];
+const JIRA_EVENTS      = ["jira:issue_created", "jira:issue_updated", "jira:issue_deleted", "jira:worklog_updated"];
+const LINEAR_EVENTS    = ["Issue", "Comment", "Cycle", "Project", "Reaction"];
+const PAGERDUTY_EVENTS = ["incident.trigger", "incident.acknowledge", "incident.resolve", "incident.assign", "incident.escalate"];
+const STRIPE_EVENTS    = ["payment_intent.succeeded", "payment_intent.payment_failed", "charge.dispute.created", "customer.subscription.deleted", "invoice.payment_failed"];
+const DATADOG_EVENTS   = ["@webhook", "alert", "alert_recovery", "metric_alert", "service_check"];
+const SENTRY_EVENTS    = ["issue", "issue_resolved", "event_alert", "metric_alert", "installation.deleted"];
 
 const SOURCE_EVENTS: Record<string, string[]> = {
-  github: GITHUB_EVENTS,
-  gitlab: GITLAB_EVENTS,
-  jira: JIRA_EVENTS,
+  github:    GITHUB_EVENTS,
+  gitlab:    GITLAB_EVENTS,
+  jira:      JIRA_EVENTS,
+  linear:    LINEAR_EVENTS,
+  pagerduty: PAGERDUTY_EVENTS,
+  stripe:    STRIPE_EVENTS,
+  datadog:   DATADOG_EVENTS,
+  sentry:    SENTRY_EVENTS,
+  generic:   [],
 };
 
 const PROMPT_TEMPLATES: Record<string, string> = {
-  github: "GitHub {{payload.action}} event on {{payload.repository.full_name}}:\n\n{{payload.pull_request.title}}\n\nBy: {{payload.sender.login}}\nURL: {{payload.pull_request.html_url}}\n\nPlease summarise and suggest next actions.",
-  gitlab: "GitLab event on {{payload.project.path_with_namespace}}:\n\n{{payload.object_attributes.title}}\n\nBy: {{payload.user.name}}\nURL: {{payload.object_attributes.url}}\n\nPlease summarise and suggest next actions.",
-  jira: "Jira issue {{payload.issue.key}} {{payload.webhookEvent}}:\n\nSummary: {{payload.issue.fields.summary}}\nStatus: {{payload.issue.fields.status.name}}\nAssignee: {{payload.issue.fields.assignee.displayName}}\n\nPlease summarise and suggest next actions.",
+  github:    "GitHub {{payload.action}} event on {{payload.repository.full_name}}:\n\n{{payload.pull_request.title}}\n\nBy: {{payload.sender.login}}\nURL: {{payload.pull_request.html_url}}\n\nPlease summarise and suggest next actions.",
+  gitlab:    "GitLab event on {{payload.project.path_with_namespace}}:\n\n{{payload.object_attributes.title}}\n\nBy: {{payload.user.name}}\nURL: {{payload.object_attributes.url}}\n\nPlease summarise and suggest next actions.",
+  jira:      "Jira issue {{payload.issue.key}} {{payload.webhookEvent}}:\n\nSummary: {{payload.issue.fields.summary}}\nStatus: {{payload.issue.fields.status.name}}\nAssignee: {{payload.issue.fields.assignee.displayName}}\n\nPlease summarise and suggest next actions.",
+  linear:    "Linear {{payload.type}} event:\n\nTitle: {{payload.data.title}}\nState: {{payload.data.state.name}}\nPriority: {{payload.data.priority}}\nAssignee: {{payload.data.assignee.name}}\nURL: {{payload.url}}\n\nPlease review and suggest next actions.",
+  pagerduty: "PagerDuty incident {{payload.event}} — {{payload.incident.incident_number}}:\n\nTitle: {{payload.incident.title}}\nUrgency: {{payload.incident.urgency}}\nService: {{payload.incident.service.name}}\nURL: {{payload.incident.html_url}}\n\nPlease triage and suggest resolution steps.",
+  stripe:    "Stripe event {{payload.type}} ({{payload.id}}):\n\nObject: {{payload.data.object.object}}\nAmount: {{payload.data.object.amount}} {{payload.data.object.currency}}\nCustomer: {{payload.data.object.customer}}\n\nPlease review and take appropriate action.",
+  datadog:   "Datadog alert:\n\nTitle: {{payload.title}}\nText: {{payload.text}}\nPriority: {{payload.priority}}\nTags: {{payload.tags}}\n\nPlease investigate and suggest remediation steps.",
+  sentry:    "Sentry {{payload.action}} on project {{payload.data.issue.project.name}}:\n\nIssue: {{payload.data.issue.title}}\nLevel: {{payload.data.issue.level}}\nURL: {{payload.data.issue.web_url}}\n\nPlease investigate and suggest a fix.",
+  generic:   "Incoming webhook event type: {{event}}\n\nPayload:\n{{payload}}\n\nPlease analyse this payload and take the appropriate action.",
 };
 
 interface TriggerFormState {
@@ -198,7 +221,7 @@ export default function TriggersPage({ workspaceId }: { workspaceId: string }) {
               <Webhook className="h-6 w-6 text-primary" /> Event Triggers
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Automatically run agents when GitHub, GitLab, or Jira events occur.
+              Automatically run agents when GitHub, GitLab, Jira, Linear, PagerDuty, Stripe, Datadog, or Sentry events occur.
             </p>
           </div>
           <Button data-testid="button-add-trigger" onClick={openCreate}>
@@ -345,6 +368,12 @@ export default function TriggersPage({ workspaceId }: { workspaceId: string }) {
                         <SelectItem value="github">GitHub</SelectItem>
                         <SelectItem value="gitlab">GitLab</SelectItem>
                         <SelectItem value="jira">Jira</SelectItem>
+                        <SelectItem value="linear">Linear</SelectItem>
+                        <SelectItem value="pagerduty">PagerDuty</SelectItem>
+                        <SelectItem value="stripe">Stripe</SelectItem>
+                        <SelectItem value="datadog">Datadog</SelectItem>
+                        <SelectItem value="sentry">Sentry</SelectItem>
+                        <SelectItem value="generic">Generic / Custom Webhook</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -378,22 +407,28 @@ export default function TriggersPage({ workspaceId }: { workspaceId: string }) {
                   </Select>
                 </div>
 
-                <div className="space-y-2">
-                  <Label>Event Types <span className="text-muted-foreground font-normal">(empty = all events)</span></Label>
-                  <div className="flex flex-wrap gap-2">
-                    {(SOURCE_EVENTS[form.source] ?? []).map((ev) => (
-                      <button
-                        key={ev}
-                        type="button"
-                        data-testid={`badge-event-${ev}`}
-                        onClick={() => toggleEvent(ev)}
-                        className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${form.eventTypes.includes(ev) ? "bg-primary text-primary-foreground border-primary" : "bg-muted text-muted-foreground border-transparent hover:border-border"}`}
-                      >
-                        {ev}
-                      </button>
-                    ))}
+                {form.source === "generic" ? (
+                  <div className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+                    Any <code className="bg-muted px-1 rounded">POST</code> to the webhook URL fires this trigger. Optionally pass an event name via <code className="bg-muted px-1 rounded">?event=</code> query param or a top-level <code className="bg-muted px-1 rounded">event</code> / <code className="bg-muted px-1 rounded">type</code> field in the JSON body.
                   </div>
-                </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Label>Event Types <span className="text-muted-foreground font-normal">(empty = all events)</span></Label>
+                    <div className="flex flex-wrap gap-2">
+                      {(SOURCE_EVENTS[form.source] ?? []).map((ev) => (
+                        <button
+                          key={ev}
+                          type="button"
+                          data-testid={`badge-event-${ev}`}
+                          onClick={() => toggleEvent(ev)}
+                          className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${form.eventTypes.includes(ev) ? "bg-primary text-primary-foreground border-primary" : "bg-muted text-muted-foreground border-transparent hover:border-border"}`}
+                        >
+                          {ev}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 <div className="flex items-center gap-3">
                   <Switch id="trigger-active" checked={form.isActive} onCheckedChange={(v) => setForm({ ...form, isActive: v })} data-testid="switch-trigger-active" />
@@ -444,7 +479,7 @@ export default function TriggersPage({ workspaceId }: { workspaceId: string }) {
                     placeholder="Use {{payload.field}} to reference event payload fields."
                   />
                   <p className="text-xs text-muted-foreground">
-                    Use <code className="bg-muted px-1 rounded">{"{{payload.field}}"}</code> to insert values from the event payload.
+                    Use <code className="bg-muted px-1 rounded">{"{{payload.field}}"}</code> for payload fields, <code className="bg-muted px-1 rounded">{"{{event}}"}</code> for the event type, or <code className="bg-muted px-1 rounded">{"{{payload}}"}</code> for the full payload as JSON.
                     Example: <code className="bg-muted px-1 rounded">{"{{payload.pull_request.title}}"}</code>
                   </p>
                 </div>
@@ -452,6 +487,9 @@ export default function TriggersPage({ workspaceId }: { workspaceId: string }) {
                   <div className="rounded-md bg-muted p-3 text-xs space-y-1">
                     <p className="font-semibold">Webhook URL:</p>
                     <p className="font-mono break-all text-primary">{window.location.origin}/api/webhooks/{form.source}/{editing ? editing.id : "<trigger-id>"}</p>
+                    {form.source === "generic" && (
+                      <p className="text-muted-foreground pt-1">Send any <code className="bg-background px-1 rounded">POST</code> request with a JSON body. Use <code className="bg-background px-1 rounded">?event=my_event</code> or include an <code className="bg-background px-1 rounded">event</code> / <code className="bg-background px-1 rounded">type</code> field in the body to set the event name (defaults to <code className="bg-background px-1 rounded">custom</code>). Use <code className="bg-background px-1 rounded">{"{{payload.fieldName}}"}</code> in your prompt template to access body fields.</p>
+                    )}
                   </div>
                 )}
               </TabsContent>
@@ -474,6 +512,9 @@ export default function TriggersPage({ workspaceId }: { workspaceId: string }) {
                   )}
                   {form.source === "jira" && (
                     <p className="text-xs text-muted-foreground">Jira: Append <code className="bg-muted px-1 rounded">?token=your_secret</code> to the webhook URL.</p>
+                  )}
+                  {form.source === "generic" && (
+                    <p className="text-xs text-muted-foreground">Generic: Send the token as <code className="bg-muted px-1 rounded">Authorization: Bearer &lt;token&gt;</code> or <code className="bg-muted px-1 rounded">X-Webhook-Token: &lt;token&gt;</code> header.</p>
                   )}
                 </div>
               </TabsContent>

@@ -108,7 +108,7 @@ function WorkspaceLimitsModal({ workspace, onClose }: { workspace: Workspace; on
   const { toast } = useToast();
 
   const { data: quota, isLoading } = useQuery<QuotaData>({
-    queryKey: [`/api/workspaces/${workspace.id}/quota`],
+    queryKey: [`/api/workspaces/${workspace.id}/summary`],
   });
 
   const [maxOrch, setMaxOrch] = useState<string>("");
@@ -135,7 +135,7 @@ function WorkspaceLimitsModal({ workspace, onClose }: { workspace: Workspace; on
   const saveMutation = useMutation({
     mutationFn: (data: object) => apiRequest("PUT", `/api/workspaces/${workspace.id}/config`, data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: [`/api/workspaces/${workspace.id}/quota`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/workspaces/${workspace.id}/summary`] });
       toast({ title: "Limits saved" });
       onClose();
     },

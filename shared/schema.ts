@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, varchar, integer, boolean, timestamp, jsonb, serial, pgEnum, unique, real } from "drizzle-orm/pg-core";
+import { pgTable, text, varchar, integer, boolean, timestamp, jsonb, serial, pgEnum, unique, real, bigint } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -7,7 +7,8 @@ export const userRoleEnum = pgEnum("user_role", ["admin", "member"]);
 export const providerEnum = pgEnum("provider", ["openai", "anthropic", "gemini", "ollama", "vllm"]);
 export const orchestratorStatusEnum = pgEnum("orchestrator_status", ["active", "paused"]);
 export const taskStatusEnum = pgEnum("task_status", ["pending", "running", "completed", "failed"]);
-export const channelTypeEnum = pgEnum("channel_type", ["webhook", "api", "slack", "teams", "google_chat", "generic_webhook"]);
+export const channelTypeEnum = pgEnum("channel_type", ["webhook", "api", "slack", "teams", "google_chat", "generic_webhook", "email"]);
+export const agentRoleEnum = pgEnum("agent_role", ["devops", "data_analyst", "support", "code_review", "security", "git_ops", "monitoring", "custom"]);
 export const logLevelEnum = pgEnum("log_level", ["info", "warn", "error"]);
 export const cloudProviderEnum = pgEnum("cloud_provider", ["aws", "gcp", "azure", "ragflow", "jira", "github", "gitlab", "teams", "slack", "google_chat", "servicenow", "postgresql", "kubernetes"]);
 
@@ -64,6 +65,7 @@ export const agents = pgTable("agents", {
   description: text("description"),
   instructions: text("instructions"),
   tools: jsonb("tools").default([]),
+  role: text("role"),
   memoryEnabled: boolean("memory_enabled").default(false),
   reactEnabled: boolean("react_enabled").default(false),
   maxTokens: integer("max_tokens").default(4096),
@@ -523,3 +525,169 @@ export const providerKeys = pgTable("provider_keys", {
 });
 
 export type ProviderKey = typeof providerKeys.$inferSelect;
+
+// ── Job Queue (always-on worker backing store) ─────────────────────────────────
+export const jobQueueStatusEnum = pgEnum("job_queue_status", ["pending", "running", "completed", "failed", "cancelled"]);
+
+export const jobQueue = pgTable("job_queue", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: varchar("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  orchestratorId: varchar("orchestrator_id").notNull().references(() => orchestrators.id, { onDelete: "cascade" }),
+  agentId: varchar("agent_id").references(() => agents.id, { onDelete: "set null" }),
+  prompt: text("prompt").notNull(),
+  priority: integer("priority").default(5),
+  status: jobQueueStatusEnum("status").default("pending"),
+  source: text("source").default("manual"),
+  sourceRef: text("source_ref"),
+  scheduledFor: timestamp("scheduled_for"),
+  taskId: varchar("task_id").references(() => tasks.id, { onDelete: "set null" }),
+  error: text("error"),
+  createdAt: timestamp("created_at").defaultNow(),
+  startedAt: timestamp("started_at"),
+  completedAt: timestamp("completed_at"),
+});
+
+export const insertJobQueueSchema = createInsertSchema(jobQueue).omit({ id: true, createdAt: true, startedAt: true, completedAt: true });
+export type JobQueueItem = typeof jobQueue.$inferSelect;
+export type InsertJobQueueItem = z.infer<typeof insertJobQueueSchema>;
+
+// ── Agent Role Templates ───────────────────────────────────────────────────────
+export const agentTemplates = pgTable("agent_templates", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  name: text("name").notNull(),
+  role: text("role").notNull(),
+  description: text("description").notNull(),
+  category: text("category").notNull().default("general"),
+  icon: text("icon").notNull().default("Bot"),
+  color: text("color").notNull().default("#6366f1"),
+  instructions: text("instructions").notNull(),
+  suggestedTools: text("suggested_tools").array().default([]),
+  defaultMaxTokens: integer("default_max_tokens").default(4096),
+  defaultTemperature: integer("default_temperature").default(70),
+  isBuiltIn: boolean("is_built_in").default(true),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type AgentTemplate = typeof agentTemplates.$inferSelect;
+
+// ── Email Inbound Threads ──────────────────────────────────────────────────────
+export const emailThreads = pgTable("email_threads", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  channelId: varchar("channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
+  messageId: text("message_id").notNull(),
+  fromEmail: text("from_email").notNull(),
+  fromName: text("from_name"),
+  subject: text("subject"),
+  agentId: varchar("agent_id").references(() => agents.id, { onDelete: "set null" }),
+  history: jsonb("history").$type<Array<{ role: string; content: string }>>().default([]),
+  createdAt: timestamp("created_at").defaultNow(),
+  lastActivityAt: timestamp("last_activity_at").defaultNow(),
+}, (t) => [unique("email_threads_channel_message").on(t.channelId, t.messageId)]);
+
+export type EmailThread = typeof emailThreads.$inferSelect;
+
+// ── Trace Spans (Phase 3 — Visual Trace Graph) ────────────────────────────────
+export const traceSpans = pgTable("trace_spans", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  taskId: varchar("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  parentSpanId: varchar("parent_span_id"),
+  spanType: text("span_type").notNull().default("info"),
+  name: text("name").notNull(),
+  input: jsonb("input"),
+  output: jsonb("output"),
+  metadata: jsonb("metadata"),
+  status: text("status").notNull().default("running"),
+  startedAt: timestamp("started_at").defaultNow(),
+  endedAt: timestamp("ended_at"),
+  durationMs: integer("duration_ms"),
+  seq: integer("seq").notNull().default(0),
+});
+export type TraceSpan = typeof traceSpans.$inferSelect;
+export const insertTraceSpanSchema = createInsertSchema(traceSpans).omit({ id: true });
+export type InsertTraceSpan = z.infer<typeof insertTraceSpanSchema>;
+
+// ── Audit Log (Phase 4 — Governance) ─────────────────────────────────────────
+export const auditLog = pgTable("audit_log", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: varchar("workspace_id").references(() => workspaces.id, { onDelete: "set null" }),
+  userId: varchar("user_id").references(() => users.id, { onDelete: "set null" }),
+  username: text("username"),
+  action: text("action").notNull(),
+  resourceType: text("resource_type"),
+  resourceId: text("resource_id"),
+  resourceName: text("resource_name"),
+  details: jsonb("details"),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+export type AuditLogEntry = typeof auditLog.$inferSelect;
+
+// ── Workspace Quotas (Phase 4 — Usage Governance) ────────────────────────────
+export const workspaceQuotas = pgTable("workspace_quotas", {
+  workspaceId: varchar("workspace_id").primaryKey().references(() => workspaces.id, { onDelete: "cascade" }),
+  monthlyTokenLimit: bigint("monthly_token_limit", { mode: "number" }),
+  dailyTokenLimit: bigint("daily_token_limit", { mode: "number" }),
+  monthlyCostLimitCents: integer("monthly_cost_limit_cents"),
+  alertThresholdPct: integer("alert_threshold_pct").notNull().default(80),
+  enforcement: text("enforcement").notNull().default("warn"),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+export type WorkspaceQuota = typeof workspaceQuotas.$inferSelect;
+export const insertWorkspaceQuotaSchema = createInsertSchema(workspaceQuotas);
+export type InsertWorkspaceQuota = z.infer<typeof insertWorkspaceQuotaSchema>;
+
+// ── Prompt Templates (Phase 5 — Prompt Library) ───────────────────────────────
+export const promptTemplates = pgTable("prompt_templates", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: varchar("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  createdBy: varchar("created_by").references(() => users.id, { onDelete: "set null" }),
+  name: text("name").notNull(),
+  description: text("description"),
+  content: text("content").notNull(),
+  category: text("category").notNull().default("general"),
+  tags: text("tags").array().default([]),
+  isShared: boolean("is_shared").notNull().default(true),
+  usageCount: integer("usage_count").notNull().default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+export type PromptTemplate = typeof promptTemplates.$inferSelect;
+export const insertPromptTemplateSchema = createInsertSchema(promptTemplates).omit({ id: true, createdAt: true, updatedAt: true, usageCount: true });
+export type InsertPromptTemplate = z.infer<typeof insertPromptTemplateSchema>;
+
+// ── Alert Rules (Phase 6 — Configurable Alerting) ────────────────────────────
+export const alertRules = pgTable("alert_rules", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: varchar("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  description: text("description"),
+  triggerType: text("trigger_type").notNull(),
+  conditions: jsonb("conditions").notNull().default({}),
+  channelId: varchar("channel_id").references(() => channels.id, { onDelete: "set null" }),
+  enabled: boolean("enabled").notNull().default(true),
+  lastTriggeredAt: timestamp("last_triggered_at"),
+  triggerCount: integer("trigger_count").notNull().default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+export type AlertRule = typeof alertRules.$inferSelect;
+export const insertAlertRuleSchema = createInsertSchema(alertRules).omit({ id: true, createdAt: true, updatedAt: true, lastTriggeredAt: true, triggerCount: true });
+export type InsertAlertRule = z.infer<typeof insertAlertRuleSchema>;
+
+// ── Platform API Keys (Phase 4 — Programmatic Access) ────────────────────────
+export const platformApiKeys = pgTable("platform_api_keys", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: varchar("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  userId: varchar("user_id").references(() => users.id, { onDelete: "set null" }),
+  name: text("name").notNull(),
+  keyHash: text("key_hash").notNull().unique(),
+  keyPrefix: text("key_prefix").notNull(),
+  scopes: text("scopes").array().default([]),
+  lastUsedAt: timestamp("last_used_at"),
+  expiresAt: timestamp("expires_at"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+export type PlatformApiKey = typeof platformApiKeys.$inferSelect;
+export const insertPlatformApiKeySchema = createInsertSchema(platformApiKeys).omit({ id: true, keyHash: true, keyPrefix: true });
+export type InsertPlatformApiKey = z.infer<typeof insertPlatformApiKeySchema>;

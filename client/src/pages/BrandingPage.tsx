@@ -9,16 +9,6 @@ import { useToast } from "@/hooks/use-toast";
 import { Zap, ExternalLink } from "lucide-react";
 import type { Branding } from "@/hooks/useBranding";
 
-function isSafeUrl(url: string | null | undefined): boolean {
-  if (!url) return false;
-  try {
-    const { protocol } = new URL(url);
-    return protocol === "https:" || protocol === "http:";
-  } catch {
-    return false;
-  }
-}
-
 export default function BrandingPage() {
   const { toast } = useToast();
 
@@ -54,12 +44,7 @@ export default function BrandingPage() {
     },
   });
 
-  // Reconstruct via URL object so the taint chain from useState is broken
-  // and static analysis can confirm this value is a parsed, safe URL.
-  const logoToShow = (() => {
-    if (!isSafeUrl(appLogoUrl.trim())) return null;
-    try { return new URL(appLogoUrl.trim()).href; } catch { return null; }
-  })();
+  const logoToShow = appLogoUrl.trim() || null;
 
   return (
     <div className="max-w-2xl mx-auto px-6 py-10 space-y-8">
@@ -154,10 +139,10 @@ export default function BrandingPage() {
                     placeholder="https://example.com/favicon.ico"
                   />
                 </div>
-                {isSafeUrl(faviconUrl.trim()) && (
+                {faviconUrl.trim() && (
                   <div className="flex items-center gap-3">
                     <img
-                      src={(() => { try { return new URL(faviconUrl.trim()).href; } catch { return ""; } })()}
+                      src={faviconUrl.trim()}
                       alt="Favicon preview"
                       className="w-6 h-6 object-contain"
                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
