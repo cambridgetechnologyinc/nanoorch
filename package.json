@@ -81,7 +81,7 @@
     "fast-xml-parser": "^5.7.0",
     "framer-motion": "^11.13.1",
     "googleapis": "^171.4.0",
-    "hono": "^4.12.14",
+    "hono": "^4.12.18",
     "input-otp": "^1.4.2",
     "ioredis": "^5.10.1",
     "lodash": "^4.18.1",
